@@ -226,6 +226,14 @@ def parse_sales_file(file_path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
     movements_source["movement_type"] = movements_source["kilos"].apply(
         lambda qty: "SALE" if qty > 0 else "SALES_RETURN_OR_ADJUSTMENT"
     )
+    movements_source["load_id"] = "LOCAL_RUN"
+    movements_source["ibum_id"] = ""
+    movements_source["container_key"] = ""
+    movements_source["movement_group"] = "SALE"
+    movements_source["movement_subtype"] = movements_source["movement_type"].apply(
+        lambda movement_type: "SALE" if movement_type == "SALE" else "RETURN_OR_ADJUSTMENT"
+    )
+    movements_source["traceability_level"] = "MONTHLY_REPORT_ROW"
 
     movements_source["qty_in"] = movements_source["kilos"].apply(
         lambda qty: abs(qty) if qty < 0 else 0.0
@@ -255,6 +263,12 @@ def parse_sales_file(file_path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
         "movement_date",
         "movement_month",
         "movement_type",
+        "load_id",
+        "ibum_id",
+        "container_key",
+        "movement_group",
+        "movement_subtype",
+        "traceability_level",
         "document",
         "reference",
         "description",

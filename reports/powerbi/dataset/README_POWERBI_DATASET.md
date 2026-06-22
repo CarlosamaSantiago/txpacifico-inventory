@@ -9,6 +9,9 @@ Use these CSV files as the Power BI semantic model.
 - dim_month[movement_month] 1 -> many fact_stock_movements[movement_month]
 - dim_month[movement_month] 1 -> many fact_monthly_inventory_balance[movement_month]
 - dim_month[movement_month] 1 -> many fact_company_monthly_summary[movement_month]
+- dim_container[container_key] 1 -> many fact_stock_movements[container_key]
+- dim_container[container_key] 1 -> many fact_container_import_summary[container_key]
+- dim_product_variant[product_key] 1 -> many fact_container_import_summary[product_key]
 
 ## Main fact tables
 
@@ -16,6 +19,7 @@ Use these CSV files as the Power BI semantic model.
 - fact_monthly_inventory_balance: monthly stock balance by product/color.
 - fact_company_monthly_summary: company-level monthly stock balance.
 - fact_duplicate_lotrols: duplicated receipt roll alerts.
+- fact_container_import_summary: container receipts by reference/color.
 - fact_inventory_exceptions: combined data quality alerts.
 
 ## Core measures to create in Power BI

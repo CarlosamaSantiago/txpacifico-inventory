@@ -17,6 +17,8 @@ TABLES = {
     "company_monthly_inventory_summary": PROCESSED_DIR / "company_monthly_inventory_summary.csv",
     "negative_inventory_alerts": PROCESSED_DIR / "negative_inventory_alerts.csv",
     "duplicate_lotrols": PROCESSED_DIR / "duplicate_lotrols.csv",
+    "container_import_summary": PROCESSED_DIR / "container_import_summary.csv",
+    "container_import_header": PROCESSED_DIR / "container_import_header.csv",
     "product_master_candidate": PROCESSED_DIR / "product_master_candidate.csv",
     "stock_movements_summary_by_type": PROCESSED_DIR / "stock_movements_summary_by_type.csv",
     "stock_movements_summary_by_month": PROCESSED_DIR / "stock_movements_summary_by_month.csv",
@@ -42,6 +44,22 @@ def create_indexes(connection: sqlite3.Connection) -> None:
         ON stock_movements (movement_month, product_key);
         """,
         """
+        CREATE INDEX IF NOT EXISTS idx_stock_movements_product_month
+        ON stock_movements (product_key, movement_month);
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_stock_movements_reference_color
+        ON stock_movements (reference, color_normalized);
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_stock_movements_ibum
+        ON stock_movements (ibum_id);
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_stock_movements_container_key
+        ON stock_movements (container_key);
+        """,
+        """
         CREATE INDEX IF NOT EXISTS idx_stock_movements_type
         ON stock_movements (movement_type);
         """,
@@ -57,10 +75,21 @@ def create_indexes(connection: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_current_inventory_product
         ON current_inventory_balance (product_key);
         """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_container_import_summary_container_product
+        ON container_import_summary (container_key, product_key);
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_container_import_header_container_key
+        ON container_import_header (container_key);
+        """,
     ]
 
     for index_sql in indexes:
-        connection.execute(index_sql)
+        try:
+            connection.execute(index_sql)
+        except sqlite3.OperationalError as exc:
+            print(f"WARNING: Could not create index: {exc}")
 
     connection.commit()
 

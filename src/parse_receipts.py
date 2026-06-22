@@ -43,6 +43,11 @@ def normalize_color(value) -> str:
     return COLOR_SYNONYMS.get(color, color)
 
 
+def normalize_ibum_id(value) -> str:
+    ibum_id = normalize_text(value)
+    return re.sub(r"\s+", "", ibum_id)
+
+
 def clean_reference(value) -> str:
     if pd.isna(value):
         return ""
@@ -117,6 +122,105 @@ def find_receipt_files() -> list[Path]:
     return sorted(files)
 
 
+def find_ibum_sheet(sheet_names: list[str]) -> str | None:
+    normalized = {sheet_name: normalize_text(sheet_name) for sheet_name in sheet_names}
+
+    for sheet_name, clean_name in normalized.items():
+        if clean_name == "IBUM":
+            return sheet_name
+
+    for sheet_name, clean_name in normalized.items():
+        if "IBUM" in clean_name:
+            return sheet_name
+
+    return None
+
+
+def extract_ibum_id(excel: pd.ExcelFile, file_path: Path) -> tuple[str, str, pd.DataFrame]:
+    quality_columns = [
+        "issue_type",
+        "issue_detail",
+        "movement_date",
+        "movement_month",
+        "reference",
+        "description",
+        "color_code",
+        "color_original",
+        "color_normalized",
+        "product_key",
+        "lot",
+        "roll",
+        "lotrol",
+        "ibum_id",
+        "container_key",
+        "weight",
+        "entrada",
+        "salida",
+        "asignacion",
+        "saldo",
+        "source_file",
+        "source_sheet",
+        "source_row",
+    ]
+
+    ibum_sheet = find_ibum_sheet(excel.sheet_names)
+    ibum_id = ""
+
+    if ibum_sheet is not None:
+        try:
+            ibum_raw = pd.read_excel(
+                file_path,
+                sheet_name=ibum_sheet,
+                header=None,
+                dtype=object,
+                nrows=1,
+                usecols=[0],
+            )
+
+            if not ibum_raw.empty:
+                ibum_id = normalize_ibum_id(ibum_raw.iat[0, 0])
+        except Exception:
+            ibum_id = ""
+
+    container_key = ibum_id if ibum_id else f"MISSING_IBUM::{file_path.name}"
+
+    if ibum_id:
+        return ibum_id, container_key, pd.DataFrame(columns=quality_columns)
+
+    missing_quality = pd.DataFrame(
+        [
+            {
+                "issue_type": "MISSING_IBUM_ID",
+                "issue_detail": "Receipt workbook does not contain IBUM sheet or IBUM!A1 is empty.",
+                "movement_date": "",
+                "movement_month": "",
+                "reference": "",
+                "description": "",
+                "color_code": "",
+                "color_original": "",
+                "color_normalized": "",
+                "product_key": "",
+                "lot": "",
+                "roll": "",
+                "lotrol": "",
+                "ibum_id": "",
+                "container_key": container_key,
+                "weight": "",
+                "entrada": "",
+                "salida": "",
+                "asignacion": "",
+                "saldo": "",
+                "source_file": file_path.name,
+                "source_sheet": ibum_sheet or "",
+                "source_row": 1 if ibum_sheet else "",
+            }
+        ],
+        columns=quality_columns,
+    )
+
+    return ibum_id, container_key, missing_quality
+
+
 def find_header_row(raw_df: pd.DataFrame) -> int:
     for idx, row in raw_df.iterrows():
         values = [normalize_text(value) for value in row.tolist()]
@@ -185,7 +289,12 @@ def extract_report_date(raw_df: pd.DataFrame, file_path: Path) -> str:
     return ""
 
 
-def parse_receipt_sheet(file_path: Path, sheet_name: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+def parse_receipt_sheet(
+    file_path: Path,
+    sheet_name: str,
+    ibum_id: str,
+    container_key: str,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     raw_df = pd.read_excel(file_path, sheet_name=sheet_name, header=None, dtype=object)
 
     header_row = find_header_row(raw_df)
@@ -236,6 +345,8 @@ def parse_receipt_sheet(file_path: Path, sheet_name: str) -> tuple[pd.DataFrame,
     df["source_file"] = file_path.name
     df["source_sheet"] = sheet_name
     df["source_row"] = df.index + header_row + 2
+    df["ibum_id"] = ibum_id
+    df["container_key"] = container_key
 
     df["movement_date"] = report_date
     df["movement_month"] = movement_month
@@ -267,6 +378,10 @@ def parse_receipt_sheet(file_path: Path, sheet_name: str) -> tuple[pd.DataFrame,
     ].copy()
 
     detail["movement_type"] = "CONTAINER_RECEIPT"
+    detail["load_id"] = "LOCAL_RUN"
+    detail["movement_group"] = "IMPORT"
+    detail["movement_subtype"] = "CONTAINER_RECEIPT"
+    detail["traceability_level"] = "ROLL"
     detail["document"] = "RECEIPT_" + detail["movement_month"].str.replace("-", "_", regex=False)
     detail["location"] = ""
     detail["qty_in"] = detail["entrada"]
@@ -301,6 +416,12 @@ def parse_receipt_sheet(file_path: Path, sheet_name: str) -> tuple[pd.DataFrame,
         "movement_date",
         "movement_month",
         "movement_type",
+        "load_id",
+        "ibum_id",
+        "container_key",
+        "movement_group",
+        "movement_subtype",
+        "traceability_level",
         "document",
         "reference",
         "description",
@@ -343,6 +464,8 @@ def parse_receipt_sheet(file_path: Path, sheet_name: str) -> tuple[pd.DataFrame,
         "lot",
         "roll",
         "lotrol",
+        "ibum_id",
+        "container_key",
         "weight",
         "entrada",
         "salida",
@@ -372,10 +495,24 @@ def parse_receipt_file(file_path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
 
     all_movements = []
     all_quality = []
+    ibum_id, container_key, ibum_quality = extract_ibum_id(excel, file_path)
+
+    if not ibum_quality.empty:
+        all_quality.append(ibum_quality)
+
+    ibum_sheet = find_ibum_sheet(excel.sheet_names)
 
     for sheet_name in excel.sheet_names:
+        if ibum_sheet is not None and sheet_name == ibum_sheet:
+            continue
+
         try:
-            movements, quality = parse_receipt_sheet(file_path, sheet_name)
+            movements, quality = parse_receipt_sheet(
+                file_path,
+                sheet_name,
+                ibum_id=ibum_id,
+                container_key=container_key,
+            )
             all_movements.append(movements)
 
             if not quality.empty:
@@ -434,6 +571,8 @@ def build_duplicate_lotrol_report(raw_movements: pd.DataFrame) -> pd.DataFrame:
 
     duplicate_columns = [
         "lotrol",
+        "ibum_id",
+        "container_key",
         "duplicate_occurrences",
         "duplicate_occurrence_number",
         "should_count_in_inventory",
@@ -472,6 +611,165 @@ def deduplicate_receipts(raw_movements: pd.DataFrame) -> pd.DataFrame:
     ).reset_index(drop=True)
 
 
+def build_container_import_summary(
+    official_movements: pd.DataFrame,
+    duplicate_lotrols: pd.DataFrame,
+) -> pd.DataFrame:
+    group_cols = [
+        "container_key",
+        "ibum_id",
+        "source_file",
+        "movement_month",
+        "reference",
+        "description",
+        "color_original",
+        "color_normalized",
+        "product_key",
+    ]
+
+    summary = (
+        official_movements.groupby(group_cols, dropna=False, as_index=False)
+        .agg(
+            movement_date=("movement_date", "min"),
+            receipt_qty=("qty_in", "sum"),
+            roll_count=("qty_in", "size"),
+            unique_lotrols=("lotrol", "nunique"),
+        )
+    )
+
+    if duplicate_lotrols.empty:
+        excluded = pd.DataFrame(columns=group_cols + ["duplicate_lotrols_excluded"])
+    else:
+        excluded_source = duplicate_lotrols[
+            duplicate_lotrols["should_count_in_inventory"].astype(str).str.upper() != "TRUE"
+        ].copy()
+
+        if excluded_source.empty:
+            excluded = pd.DataFrame(columns=group_cols + ["duplicate_lotrols_excluded"])
+        else:
+            excluded = (
+                excluded_source.groupby(group_cols, dropna=False, as_index=False)
+                .agg(duplicate_lotrols_excluded=("lotrol", "nunique"))
+            )
+
+    summary = summary.merge(excluded, on=group_cols, how="left")
+    summary["duplicate_lotrols_excluded"] = summary["duplicate_lotrols_excluded"].fillna(0).astype(int)
+
+    summary["validation_status"] = "OK"
+    summary.loc[summary["ibum_id"].fillna("").astype(str).str.strip() == "", "validation_status"] = "WARNING_MISSING_IBUM"
+    summary.loc[
+        (summary["validation_status"] == "OK")
+        & (summary["duplicate_lotrols_excluded"] > 0),
+        "validation_status",
+    ] = "REVIEW_DUPLICATE_LOTROL"
+    summary.loc[
+        (summary["validation_status"] == "WARNING_MISSING_IBUM")
+        & (summary["duplicate_lotrols_excluded"] > 0),
+        "validation_status",
+    ] = "WARNING_MISSING_IBUM_AND_DUPLICATES"
+
+    ordered_cols = [
+        "container_key",
+        "ibum_id",
+        "source_file",
+        "movement_date",
+        "movement_month",
+        "reference",
+        "description",
+        "color_original",
+        "color_normalized",
+        "product_key",
+        "receipt_qty",
+        "roll_count",
+        "unique_lotrols",
+        "duplicate_lotrols_excluded",
+        "validation_status",
+    ]
+
+    return summary[ordered_cols].sort_values(
+        ["movement_month", "container_key", "reference", "color_normalized"]
+    )
+
+
+def build_container_import_header(
+    official_movements: pd.DataFrame,
+    duplicate_lotrols: pd.DataFrame,
+) -> pd.DataFrame:
+    group_cols = ["container_key", "ibum_id", "source_file"]
+
+    header = (
+        official_movements.groupby(group_cols, dropna=False, as_index=False)
+        .agg(
+            movement_date=("movement_date", "min"),
+            movement_month=("movement_month", "min"),
+            total_receipt_qty=("qty_in", "sum"),
+            unique_references=("reference", "nunique"),
+            unique_product_keys=("product_key", "nunique"),
+            unique_colors=("color_normalized", "nunique"),
+            unique_lotrols=("lotrol", "nunique"),
+        )
+    )
+
+    if duplicate_lotrols.empty:
+        duplicate_header = pd.DataFrame(
+            columns=group_cols + ["duplicate_lotrol_count", "duplicate_qty_excluded"]
+        )
+    else:
+        excluded_source = duplicate_lotrols[
+            duplicate_lotrols["should_count_in_inventory"].astype(str).str.upper() != "TRUE"
+        ].copy()
+
+        if excluded_source.empty:
+            duplicate_header = pd.DataFrame(
+                columns=group_cols + ["duplicate_lotrol_count", "duplicate_qty_excluded"]
+            )
+        else:
+            duplicate_header = (
+                excluded_source.groupby(group_cols, dropna=False, as_index=False)
+                .agg(
+                    duplicate_lotrol_count=("lotrol", "nunique"),
+                    duplicate_qty_excluded=("duplicate_qty_excluded", "sum"),
+                )
+            )
+
+    header = header.merge(duplicate_header, on=group_cols, how="left")
+    header["duplicate_lotrol_count"] = header["duplicate_lotrol_count"].fillna(0).astype(int)
+    header["duplicate_qty_excluded"] = header["duplicate_qty_excluded"].fillna(0.0)
+    header["has_missing_ibum"] = header["ibum_id"].fillna("").astype(str).str.strip() == ""
+
+    header["validation_status"] = "OK"
+    header.loc[header["has_missing_ibum"], "validation_status"] = "WARNING_MISSING_IBUM"
+    header.loc[
+        (~header["has_missing_ibum"])
+        & (header["duplicate_lotrol_count"] > 0),
+        "validation_status",
+    ] = "REVIEW_DUPLICATE_LOTROL"
+    header.loc[
+        header["has_missing_ibum"]
+        & (header["duplicate_lotrol_count"] > 0),
+        "validation_status",
+    ] = "WARNING_MISSING_IBUM_AND_DUPLICATES"
+
+    ordered_cols = [
+        "container_key",
+        "ibum_id",
+        "source_file",
+        "movement_date",
+        "movement_month",
+        "total_receipt_qty",
+        "unique_references",
+        "unique_product_keys",
+        "unique_colors",
+        "unique_lotrols",
+        "duplicate_lotrol_count",
+        "duplicate_qty_excluded",
+        "has_missing_ibum",
+        "validation_status",
+    ]
+
+    return header[ordered_cols].sort_values(["movement_month", "container_key"])
+
+
 def main() -> None:
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -502,6 +800,8 @@ def main() -> None:
 
     duplicate_lotrols = build_duplicate_lotrol_report(raw_movements)
     official_movements = deduplicate_receipts(raw_movements)
+    container_summary = build_container_import_summary(official_movements, duplicate_lotrols)
+    container_header = build_container_import_header(official_movements, duplicate_lotrols)
 
     if all_quality:
         receipts_quality = pd.concat(all_quality, ignore_index=True)
@@ -528,6 +828,8 @@ def main() -> None:
                 "lot",
                 "roll",
                 "lotrol",
+                "ibum_id",
+                "container_key",
                 "qty_in",
                 "duplicate_occurrence_number",
                 "should_count_in_inventory",
@@ -568,12 +870,16 @@ def main() -> None:
     summary_path = PROCESSED_DIR / "receipt_summary_by_month_product.csv"
     duplicate_path = PROCESSED_DIR / "duplicate_lotrols.csv"
     quality_path = PROCESSED_DIR / "receipts_quality_checks.csv"
+    container_summary_path = PROCESSED_DIR / "container_import_summary.csv"
+    container_header_path = PROCESSED_DIR / "container_import_header.csv"
 
     raw_movements.to_csv(raw_path, index=False, encoding="utf-8-sig")
     official_movements.to_csv(official_path, index=False, encoding="utf-8-sig")
     summary.to_csv(summary_path, index=False, encoding="utf-8-sig")
     duplicate_lotrols.to_csv(duplicate_path, index=False, encoding="utf-8-sig")
     receipts_quality.to_csv(quality_path, index=False, encoding="utf-8-sig")
+    container_summary.to_csv(container_summary_path, index=False, encoding="utf-8-sig")
+    container_header.to_csv(container_header_path, index=False, encoding="utf-8-sig")
 
     raw_qty = raw_movements["qty_in"].sum()
     official_qty = official_movements["qty_in"].sum()
@@ -587,11 +893,15 @@ def main() -> None:
     print(f"Duplicate LOTROL values: {duplicate_lotrols['lotrol'].nunique() if not duplicate_lotrols.empty else 0:,}")
     print(f"Duplicate qty excluded: {duplicate_excluded_qty:,.2f}")
     print(f"Quality check rows: {len(receipts_quality):,}")
+    print(f"Container summary rows: {len(container_summary):,}")
+    print(f"Container header rows: {len(container_header):,}")
     print(f"Wrote: {raw_path}")
     print(f"Wrote: {official_path}")
     print(f"Wrote: {summary_path}")
     print(f"Wrote: {duplicate_path}")
     print(f"Wrote: {quality_path}")
+    print(f"Wrote: {container_summary_path}")
+    print(f"Wrote: {container_header_path}")
 
 
 if __name__ == "__main__":

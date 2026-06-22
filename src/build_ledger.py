@@ -20,6 +20,12 @@ STANDARD_COLUMNS = [
     "movement_date",
     "movement_month",
     "movement_type",
+    "load_id",
+    "ibum_id",
+    "container_key",
+    "movement_group",
+    "movement_subtype",
+    "traceability_level",
     "document",
     "reference",
     "description",
@@ -107,6 +113,54 @@ def to_number(series: pd.Series) -> pd.Series:
 
     return pd.to_numeric(cleaned, errors="coerce").fillna(0.0)
 
+
+def default_movement_group(movement_type: str, movement_source: str) -> str:
+    movement_type = str(movement_type).strip().upper()
+    movement_source = str(movement_source).strip().lower()
+
+    if movement_type.startswith("OPENING") or movement_source == "opening":
+        return "OPENING"
+    if movement_type == "CONTAINER_RECEIPT" or movement_source == "receipts":
+        return "IMPORT"
+    if movement_type in {"SALE", "SALES_RETURN_OR_ADJUSTMENT"} or movement_source == "sales":
+        return "SALE"
+
+    return "OTHER"
+
+
+def default_movement_subtype(movement_type: str) -> str:
+    movement_type = str(movement_type).strip().upper()
+
+    if movement_type == "OPENING_PHYSICAL_ROLL":
+        return "PHYSICAL_ROLL"
+    if movement_type == "OPENING_RIB_COLLAR_AGG":
+        return "RIB_COLLAR_AGG"
+    if movement_type == "CONTAINER_RECEIPT":
+        return "CONTAINER_RECEIPT"
+    if movement_type == "SALE":
+        return "SALE"
+    if movement_type == "SALES_RETURN_OR_ADJUSTMENT":
+        return "RETURN_OR_ADJUSTMENT"
+
+    return movement_type or "OTHER"
+
+
+def default_traceability_level(movement_type: str, movement_source: str) -> str:
+    movement_type = str(movement_type).strip().upper()
+    movement_source = str(movement_source).strip().lower()
+
+    if movement_type == "OPENING_PHYSICAL_ROLL":
+        return "ROLL"
+    if movement_type == "OPENING_RIB_COLLAR_AGG":
+        return "AGGREGATE"
+    if movement_type == "CONTAINER_RECEIPT" or movement_source == "receipts":
+        return "ROLL"
+    if movement_type in {"SALE", "SALES_RETURN_OR_ADJUSTMENT"} or movement_source == "sales":
+        return "MONTHLY_REPORT_ROW"
+
+    return "UNKNOWN"
+
+
 def parse_movement_dates(series: pd.Series) -> pd.Series:
     values = series.fillna("").astype(str).str.strip()
 
@@ -149,6 +203,12 @@ def clean_ledger(df: pd.DataFrame) -> pd.DataFrame:
         "movement_date",
         "movement_month",
         "movement_type",
+        "load_id",
+        "ibum_id",
+        "container_key",
+        "movement_group",
+        "movement_subtype",
+        "traceability_level",
         "document",
         "reference",
         "description",
@@ -172,6 +232,36 @@ def clean_ledger(df: pd.DataFrame) -> pd.DataFrame:
     for column in text_columns:
         if column in df.columns:
             df[column] = df[column].fillna("").astype(str).str.strip()
+
+    df["load_id"] = df["load_id"].replace("", "LOCAL_RUN")
+
+    missing_container_key = (
+        (df["movement_source"] == "receipts")
+        & (df["container_key"] == "")
+    )
+    df.loc[missing_container_key & (df["ibum_id"] != ""), "container_key"] = df.loc[
+        missing_container_key & (df["ibum_id"] != ""),
+        "ibum_id",
+    ]
+    df.loc[missing_container_key & (df["ibum_id"] == ""), "container_key"] = (
+        "MISSING_IBUM::" + df.loc[missing_container_key & (df["ibum_id"] == ""), "source_file"]
+    )
+
+    df.loc[df["movement_group"] == "", "movement_group"] = df.loc[
+        df["movement_group"] == ""
+    ].apply(
+        lambda row: default_movement_group(row["movement_type"], row["movement_source"]),
+        axis=1,
+    )
+    df.loc[df["movement_subtype"] == "", "movement_subtype"] = df.loc[
+        df["movement_subtype"] == ""
+    ]["movement_type"].apply(default_movement_subtype)
+    df.loc[df["traceability_level"] == "", "traceability_level"] = df.loc[
+        df["traceability_level"] == ""
+    ].apply(
+        lambda row: default_traceability_level(row["movement_type"], row["movement_source"]),
+        axis=1,
+    )
 
     df["movement_date"] = parse_movement_dates(df["movement_date"])
     df["movement_month"] = df["movement_date"].dt.strftime("%Y-%m")

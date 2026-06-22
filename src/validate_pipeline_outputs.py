@@ -19,6 +19,8 @@ REQUIRED_PROCESSED_FILES = [
     "receipt_stock_movements_raw.csv",
     "receipt_stock_movements.csv",
     "duplicate_lotrols.csv",
+    "container_import_summary.csv",
+    "container_import_header.csv",
     "stock_movements.csv",
     "monthly_inventory_balance.csv",
     "current_inventory_balance.csv",
@@ -30,9 +32,11 @@ REQUIRED_POWERBI_FILES = [
     "fact_monthly_inventory_balance.csv",
     "fact_company_monthly_summary.csv",
     "fact_duplicate_lotrols.csv",
+    "fact_container_import_summary.csv",
     "fact_inventory_exceptions.csv",
     "dim_product_variant.csv",
     "dim_month.csv",
+    "dim_container.csv",
 ]
 
 
@@ -164,8 +168,101 @@ def validate_receipts(raw_receipts: pd.DataFrame, official_receipts: pd.DataFram
     return errors
 
 
+def validate_container_outputs(
+    official_receipts: pd.DataFrame,
+    container_summary: pd.DataFrame,
+    container_header: pd.DataFrame,
+    receipts_quality: pd.DataFrame,
+) -> tuple[list[str], list[str]]:
+    errors = []
+    warnings = []
+
+    if container_summary.empty:
+        errors.append("container_import_summary.csv exists but has no rows.")
+
+    if container_header.empty:
+        errors.append("container_import_header.csv exists but has no rows.")
+
+    official_qty = to_number(official_receipts["qty_in"]).sum()
+
+    if "receipt_qty" not in container_summary.columns:
+        errors.append("container_import_summary.csv is missing receipt_qty.")
+    else:
+        container_qty = to_number(container_summary["receipt_qty"]).sum()
+
+        if not almost_equal(official_qty, container_qty):
+            errors.append(
+                f"Container summary mismatch: receipt_qty = {container_qty:,.2f}, "
+                f"but official receipt qty = {official_qty:,.2f}"
+            )
+
+    for required_col in ["ibum_id", "container_key"]:
+        if required_col not in official_receipts.columns:
+            errors.append(f"Official receipt movements are missing {required_col}.")
+        if required_col not in container_summary.columns:
+            errors.append(f"container_import_summary.csv is missing {required_col}.")
+        if required_col not in container_header.columns:
+            errors.append(f"container_import_header.csv is missing {required_col}.")
+
+    if {"ibum_id", "container_key", "source_file"}.issubset(official_receipts.columns):
+        imports = official_receipts.copy()
+        missing_ibum = imports["ibum_id"].fillna("").astype(str).str.strip().eq("")
+        expected_fallback = "MISSING_IBUM::" + imports["source_file"].fillna("").astype(str).str.strip()
+        bad_container_key = missing_ibum & (
+            imports["container_key"].fillna("").astype(str).str.strip() != expected_fallback
+        )
+        missing_both = missing_ibum & imports["container_key"].fillna("").astype(str).str.strip().eq("")
+
+        if int((bad_container_key | missing_both).sum()) > 0:
+            errors.append(
+                "Every receipt movement with missing ibum_id must have container_key = MISSING_IBUM::<source_file>."
+            )
+
+        missing_ibum_files = set(imports.loc[missing_ibum, "source_file"].dropna().astype(str))
+
+        if missing_ibum_files:
+            quality_missing_files = set()
+
+            if not receipts_quality.empty and {"issue_type", "source_file"}.issubset(receipts_quality.columns):
+                quality_missing_files = set(
+                    receipts_quality.loc[
+                        receipts_quality["issue_type"].fillna("").astype(str).eq("MISSING_IBUM_ID"),
+                        "source_file",
+                    ].dropna().astype(str)
+                )
+
+            unflagged = sorted(missing_ibum_files - quality_missing_files)
+
+            if unflagged:
+                errors.append(
+                    "Receipt files with missing IBUM were not flagged in receipts_quality_checks.csv: "
+                    + ", ".join(unflagged)
+                )
+            else:
+                warnings.append(
+                    f"{len(missing_ibum_files):,} receipt files are missing IBUM. This is allowed but flagged as MISSING_IBUM_ID."
+                )
+
+    return errors, warnings
+
+
 def validate_ledger(ledger: pd.DataFrame) -> list[str]:
     errors = []
+
+    required_traceability_cols = [
+        "load_id",
+        "ibum_id",
+        "container_key",
+        "movement_group",
+        "movement_subtype",
+        "traceability_level",
+    ]
+
+    missing_traceability_cols = [col for col in required_traceability_cols if col not in ledger.columns]
+
+    if missing_traceability_cols:
+        errors.append(f"Ledger is missing traceability columns: {missing_traceability_cols}")
+        return errors
 
     qty_in = to_number(ledger["qty_in"])
     qty_out = to_number(ledger["qty_out"])
@@ -187,6 +284,57 @@ def validate_ledger(ledger: pd.DataFrame) -> list[str]:
 
     if missing_product_key > 0:
         errors.append(f"Ledger has {missing_product_key:,} rows with missing product_key.")
+
+    imports = ledger[ledger["movement_group"].fillna("").astype(str).str.upper().eq("IMPORT")].copy()
+
+    if not imports.empty:
+        ibum = imports["ibum_id"].fillna("").astype(str).str.strip()
+        container_key = imports["container_key"].fillna("").astype(str).str.strip()
+        source_file = imports["source_file"].fillna("").astype(str).str.strip()
+        expected_fallback = "MISSING_IBUM::" + source_file
+
+        bad_imports = (ibum.eq("") & container_key.ne(expected_fallback)) | container_key.eq("")
+
+        if int(bad_imports.sum()) > 0:
+            errors.append(
+                f"Ledger has {int(bad_imports.sum()):,} import rows without ibum_id or valid missing-IBUM container_key."
+            )
+
+    return errors
+
+
+def validate_powerbi_exports() -> list[str]:
+    errors = []
+
+    stock_path = POWERBI_DATASET_DIR / "fact_stock_movements.csv"
+    container_path = POWERBI_DATASET_DIR / "fact_container_import_summary.csv"
+    dim_container_path = POWERBI_DATASET_DIR / "dim_container.csv"
+
+    stock = read_csv(stock_path)
+    container_summary = read_csv(container_path)
+    dim_container = read_csv(dim_container_path)
+
+    required_stock_cols = [
+        "ibum_id",
+        "container_key",
+        "movement_group",
+        "movement_subtype",
+        "traceability_level",
+    ]
+
+    missing_stock_cols = [col for col in required_stock_cols if col not in stock.columns]
+
+    if missing_stock_cols:
+        errors.append(f"Power BI fact_stock_movements.csv is missing columns: {missing_stock_cols}")
+
+    for table_name, df in [
+        ("fact_container_import_summary.csv", container_summary),
+        ("dim_container.csv", dim_container),
+    ]:
+        if "container_key" not in df.columns:
+            errors.append(f"Power BI {table_name} is missing container_key.")
+        if "ibum_id" not in df.columns:
+            errors.append(f"Power BI {table_name} is missing ibum_id.")
 
     return errors
 
@@ -250,6 +398,11 @@ def print_summary(opening, sales, official_receipts, ledger, monthly, duplicate_
     print(f"Latest month:               {latest_month}")
     print(f"Latest closing stock:       {latest_closing:,.2f}")
     print(f"Duplicate LOTROL values:    {duplicate_lotrol_count:,}")
+    if "ibum_id" in official_receipts.columns:
+        missing_ibum_files = official_receipts[
+            official_receipts["ibum_id"].fillna("").astype(str).str.strip().eq("")
+        ]["source_file"].nunique()
+        print(f"Receipt files missing IBUM:  {missing_ibum_files:,}")
     print("-" * 80)
 
 
@@ -265,6 +418,9 @@ def main() -> None:
     raw_receipts = read_csv(PROCESSED_DIR / "receipt_stock_movements_raw.csv")
     official_receipts = read_csv(PROCESSED_DIR / "receipt_stock_movements.csv")
     duplicate_lotrols = read_csv(PROCESSED_DIR / "duplicate_lotrols.csv")
+    container_summary = read_csv(PROCESSED_DIR / "container_import_summary.csv")
+    container_header = read_csv(PROCESSED_DIR / "container_import_header.csv")
+    receipts_quality = read_csv(PROCESSED_DIR / "receipts_quality_checks.csv")
     ledger = read_csv(PROCESSED_DIR / "stock_movements.csv")
     monthly = read_csv(PROCESSED_DIR / "monthly_inventory_balance.csv")
     company_summary = read_csv(PROCESSED_DIR / "company_monthly_inventory_summary.csv")
@@ -272,8 +428,16 @@ def main() -> None:
     errors.extend(validate_opening(opening))
     errors.extend(validate_sales(sales))
     errors.extend(validate_receipts(raw_receipts, official_receipts, duplicate_lotrols))
+    container_errors, warnings = validate_container_outputs(
+        official_receipts=official_receipts,
+        container_summary=container_summary,
+        container_header=container_header,
+        receipts_quality=receipts_quality,
+    )
+    errors.extend(container_errors)
     errors.extend(validate_ledger(ledger))
     errors.extend(validate_monthly_balance(ledger, monthly, company_summary))
+    errors.extend(validate_powerbi_exports())
 
     print_summary(
         opening=opening,
@@ -293,6 +457,14 @@ def main() -> None:
             print(f"- {error}")
 
         sys.exit(1)
+
+    if warnings:
+        print()
+        print("VALIDATION WARNINGS")
+        print("=" * 80)
+
+        for warning in warnings:
+            print(f"- {warning}")
 
     print()
     print("VALIDATION PASSED")

@@ -16,6 +16,8 @@ INPUTS = {
     "current_inventory_balance": PROCESSED_DIR / "current_inventory_balance.csv",
     "company_monthly_inventory_summary": PROCESSED_DIR / "company_monthly_inventory_summary.csv",
     "duplicate_lotrols": PROCESSED_DIR / "duplicate_lotrols.csv",
+    "container_import_summary": PROCESSED_DIR / "container_import_summary.csv",
+    "container_import_header": PROCESSED_DIR / "container_import_header.csv",
     "product_master_candidate": PROCESSED_DIR / "product_master_candidate.csv",
 }
 
@@ -101,6 +103,12 @@ def prepare_stock_movements(df: pd.DataFrame) -> pd.DataFrame:
         "movement_month",
         "movement_source",
         "movement_type",
+        "load_id",
+        "ibum_id",
+        "container_key",
+        "movement_group",
+        "movement_subtype",
+        "traceability_level",
         "document",
         "reference",
         "description",
@@ -257,6 +265,92 @@ def build_dim_month(monthly_balance: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def prepare_container_import_summary(df: pd.DataFrame) -> pd.DataFrame:
+    df = clean_text_columns(df)
+
+    numeric_cols = [
+        "receipt_qty",
+        "roll_count",
+        "unique_lotrols",
+        "duplicate_lotrols_excluded",
+    ]
+
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = to_number(df[col])
+
+    return df.copy()
+
+
+def build_dim_container(container_header: pd.DataFrame, stock_movements: pd.DataFrame) -> pd.DataFrame:
+    container_header = clean_text_columns(container_header)
+
+    if container_header.empty:
+        imports = stock_movements[
+            stock_movements.get("movement_group", "").astype(str).str.upper().eq("IMPORT")
+        ].copy() if "movement_group" in stock_movements.columns else pd.DataFrame()
+
+        if imports.empty:
+            return pd.DataFrame(
+                columns=[
+                    "container_key",
+                    "ibum_id",
+                    "source_file",
+                    "movement_date",
+                    "movement_month",
+                    "total_receipt_qty",
+                    "unique_references",
+                    "unique_product_keys",
+                    "unique_colors",
+                    "unique_lotrols",
+                    "duplicate_lotrol_count",
+                    "duplicate_qty_excluded",
+                    "has_missing_ibum",
+                    "validation_status",
+                ]
+            )
+
+        container_header = (
+            imports.groupby(["container_key", "ibum_id", "source_file"], dropna=False, as_index=False)
+            .agg(
+                movement_date=("movement_date", "min"),
+                movement_month=("movement_month", "min"),
+                total_receipt_qty=("qty_in", "sum"),
+                unique_references=("reference", "nunique"),
+                unique_product_keys=("product_key", "nunique"),
+                unique_colors=("color_normalized", "nunique"),
+                unique_lotrols=("lotrol", "nunique"),
+            )
+        )
+        container_header["duplicate_lotrol_count"] = 0
+        container_header["duplicate_qty_excluded"] = 0.0
+        container_header["has_missing_ibum"] = container_header["ibum_id"].eq("")
+        container_header["validation_status"] = container_header["has_missing_ibum"].map(
+            {True: "WARNING_MISSING_IBUM", False: "OK"}
+        )
+
+    numeric_cols = [
+        "total_receipt_qty",
+        "unique_references",
+        "unique_product_keys",
+        "unique_colors",
+        "unique_lotrols",
+        "duplicate_lotrol_count",
+        "duplicate_qty_excluded",
+    ]
+
+    for col in numeric_cols:
+        if col in container_header.columns:
+            container_header[col] = to_number(container_header[col])
+
+    if "has_missing_ibum" in container_header.columns:
+        container_header["has_missing_ibum"] = (
+            container_header["has_missing_ibum"].astype(str).str.upper().isin(["TRUE", "1", "YES"])
+        )
+
+    return container_header.sort_values(["movement_month", "container_key"])
+
+
 def build_exceptions_table() -> pd.DataFrame:
     frames = []
 
@@ -311,6 +405,9 @@ Use these CSV files as the Power BI semantic model.
 - dim_month[movement_month] 1 -> many fact_stock_movements[movement_month]
 - dim_month[movement_month] 1 -> many fact_monthly_inventory_balance[movement_month]
 - dim_month[movement_month] 1 -> many fact_company_monthly_summary[movement_month]
+- dim_container[container_key] 1 -> many fact_stock_movements[container_key]
+- dim_container[container_key] 1 -> many fact_container_import_summary[container_key]
+- dim_product_variant[product_key] 1 -> many fact_container_import_summary[product_key]
 
 ## Main fact tables
 
@@ -318,6 +415,7 @@ Use these CSV files as the Power BI semantic model.
 - fact_monthly_inventory_balance: monthly stock balance by product/color.
 - fact_company_monthly_summary: company-level monthly stock balance.
 - fact_duplicate_lotrols: duplicated receipt roll alerts.
+- fact_container_import_summary: container receipts by reference/color.
 - fact_inventory_exceptions: combined data quality alerts.
 
 ## Core measures to create in Power BI
@@ -347,10 +445,13 @@ def main() -> None:
     monthly_balance = prepare_monthly_balance(read_csv(INPUTS["monthly_inventory_balance"]))
     company_summary = prepare_monthly_balance(read_csv(INPUTS["company_monthly_inventory_summary"]))
     duplicate_lotrols = clean_text_columns(read_csv(INPUTS["duplicate_lotrols"]))
+    container_summary = prepare_container_import_summary(read_csv(INPUTS["container_import_summary"]))
+    container_header = read_csv(INPUTS["container_import_header"])
     product_master = read_csv(INPUTS["product_master_candidate"])
 
     dim_product_variant = build_dim_product_variant(product_master, stock_movements)
     dim_month = build_dim_month(monthly_balance)
+    dim_container = build_dim_container(container_header, stock_movements)
     exceptions = build_exceptions_table()
 
     outputs = {
@@ -358,9 +459,11 @@ def main() -> None:
         "fact_monthly_inventory_balance.csv": monthly_balance,
         "fact_company_monthly_summary.csv": company_summary,
         "fact_duplicate_lotrols.csv": duplicate_lotrols,
+        "fact_container_import_summary.csv": container_summary,
         "fact_inventory_exceptions.csv": exceptions,
         "dim_product_variant.csv": dim_product_variant,
         "dim_month.csv": dim_month,
+        "dim_container.csv": dim_container,
     }
 
     for file_name, df in outputs.items():

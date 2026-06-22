@@ -1,0 +1,6 @@
+﻿movement_source,movement_type,movement_rows,qty_in,qty_out,net_qty,unique_product_keys,unique_lotrols
+opening,OPENING_PHYSICAL_ROLL,9307,181071.82,0.0,181071.82,155,9307
+opening,OPENING_RIB_COLLAR_AGG,145,67187.51,0.0,67187.51,145,0
+receipts,CONTAINER_RECEIPT,8938,210326.97,0.0,210326.97,190,8938
+sales,SALE,1234,0.0,229729.07,-229729.07,354,0
+sales,SALES_RETURN_OR_ADJUSTMENT,58,2683.11,0.0,2683.11,54,0

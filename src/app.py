@@ -390,6 +390,7 @@ def load_data():
         "negative_alerts",
         "stock_movements",
         "container_import_summary",
+        "container_import_header",
         "duplicate_lotrols",
         "inventory_exceptions",
     ]:

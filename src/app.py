@@ -216,6 +216,104 @@ def prepare_container_table(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def build_container_tables_from_movements(stock_movements: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if stock_movements.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    movements = stock_movements.copy()
+
+    if "movement_group" in movements.columns:
+        import_mask = movements["movement_group"].fillna("").astype(str).str.upper().eq("IMPORT")
+    elif "movement_type" in movements.columns:
+        import_mask = movements["movement_type"].fillna("").astype(str).str.upper().eq("CONTAINER_RECEIPT")
+    elif "movement_source" in movements.columns:
+        import_mask = movements["movement_source"].fillna("").astype(str).str.lower().eq("receipts")
+    else:
+        return pd.DataFrame(), pd.DataFrame()
+
+    imports = movements[import_mask].copy()
+
+    if imports.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    for column in [
+        "ibum_id",
+        "container_key",
+        "source_file",
+        "movement_date",
+        "movement_month",
+        "reference",
+        "description",
+        "color_original",
+        "color_normalized",
+        "product_key",
+        "lotrol",
+    ]:
+        if column not in imports.columns:
+            imports[column] = ""
+
+        imports[column] = imports[column].fillna("").astype(str).str.strip()
+
+    if "qty_in" not in imports.columns:
+        imports["qty_in"] = 0.0
+
+    imports["qty_in"] = to_number(imports["qty_in"])
+
+    missing_container_key = imports["container_key"].eq("")
+    imports.loc[missing_container_key & imports["ibum_id"].ne(""), "container_key"] = imports.loc[
+        missing_container_key & imports["ibum_id"].ne(""),
+        "ibum_id",
+    ]
+    imports.loc[imports["container_key"].eq(""), "container_key"] = (
+        "MISSING_IBUM::" + imports.loc[imports["container_key"].eq(""), "source_file"]
+    )
+
+    group_cols = [
+        "container_key",
+        "ibum_id",
+        "source_file",
+        "movement_month",
+        "reference",
+        "description",
+        "color_original",
+        "color_normalized",
+        "product_key",
+    ]
+
+    summary = (
+        imports.groupby(group_cols, dropna=False, as_index=False)
+        .agg(
+            movement_date=("movement_date", "min"),
+            receipt_qty=("qty_in", "sum"),
+            roll_count=("qty_in", "size"),
+            unique_lotrols=("lotrol", lambda values: values[values != ""].nunique()),
+        )
+        .sort_values(["movement_month", "container_key", "reference", "color_normalized"])
+    )
+    summary["duplicate_lotrols_excluded"] = 0
+    summary["validation_status"] = "REBUILT_FROM_STOCK_MOVEMENTS"
+
+    header = (
+        imports.groupby(["container_key", "ibum_id", "source_file"], dropna=False, as_index=False)
+        .agg(
+            movement_date=("movement_date", "min"),
+            movement_month=("movement_month", "min"),
+            total_receipt_qty=("qty_in", "sum"),
+            unique_references=("reference", "nunique"),
+            unique_product_keys=("product_key", "nunique"),
+            unique_colors=("color_normalized", "nunique"),
+            unique_lotrols=("lotrol", lambda values: values[values != ""].nunique()),
+        )
+        .sort_values(["movement_month", "container_key"])
+    )
+    header["duplicate_lotrol_count"] = 0
+    header["duplicate_qty_excluded"] = 0.0
+    header["has_missing_ibum"] = header["ibum_id"].eq("")
+    header["validation_status"] = "REBUILT_FROM_STOCK_MOVEMENTS"
+
+    return prepare_container_table(summary), prepare_container_table(header)
+
+
 def format_number(value: float) -> str:
     return f"{value:,.2f}"
 
@@ -368,6 +466,15 @@ def load_data():
     container_import_header = prepare_container_table(read_csv(FILES["container_import_header"]))
     product_master = read_csv(FILES["product_master"])
     inventory_exceptions = read_csv(FILES["inventory_exceptions"])
+
+    if container_import_summary.empty or container_import_header.empty:
+        fallback_summary, fallback_header = build_container_tables_from_movements(stock_movements)
+
+        if container_import_summary.empty:
+            container_import_summary = fallback_summary
+
+        if container_import_header.empty:
+            container_import_header = fallback_header
 
     data = {
         "company_summary": company_summary,
@@ -1085,8 +1192,22 @@ def render_containers(data, filters):
     st.subheader("Containers / IBUM")
 
     if container_header.empty:
-        st.error("container_import_header.csv was not found. Run the pipeline first.")
+        st.error(
+            "No se encontró información de contenedores/IBUM en este despliegue. "
+            "Verifica que data/processed/container_import_header.csv, "
+            "data/processed/container_import_summary.csv y stock_movements.csv estén incluidos "
+            "en el repositorio desplegado, o vuelve a desplegar el último commit con la pipeline ejecutada."
+        )
         return
+
+    if "validation_status" in container_header.columns and container_header["validation_status"].astype(str).str.contains(
+        "REBUILT_FROM_STOCK_MOVEMENTS",
+        na=False,
+    ).any():
+        st.warning(
+            "La tabla de contenedores fue reconstruida en memoria desde stock_movements.csv "
+            "porque los CSV de contenedores no estaban disponibles en el despliegue."
+        )
 
     if not container_summary.empty and "container_key" in container_summary.columns:
         visible_containers = set(container_summary["container_key"].dropna().astype(str))

@@ -556,17 +556,6 @@ def render_sidebar(data):
         index=len(months) - 1,
     )
 
-    st.sidebar.caption(
-        "Puedes buscar por código, nombre de referencia o color. "
-        "Ejemplo: 070101, QATAR, PERUANA, PALO DE ROSA."
-    )
-
-    selected_product_labels = st.sidebar.multiselect(
-        "Buscar referencia / producto / color",
-        options=product_labels,
-        default=[],
-    )
-
     label_to_key = (
         product_selector.set_index("product_display_label")["product_key"].to_dict()
         if not product_selector.empty
@@ -580,15 +569,9 @@ def render_sidebar(data):
     ]
 
     selected_descriptions = st.sidebar.multiselect(
-        "Descripcion / nombre de producto",
+        "Nombre de referencia",
         options=descriptions,
         default=[],
-    )
-
-    quick_search = st.sidebar.text_input(
-        "Búsqueda rápida",
-        value="",
-        placeholder="qatar palo",
     )
 
     selected_references = st.sidebar.multiselect(
@@ -870,8 +853,7 @@ def render_monthly_balance(data, filters):
     st.subheader("Month-by-month inventory balance")
 
     display_cols = [
-        "movement_month",
-        "product_display_label",
+        "movement_month",   
         "reference",
         "description",
         "color_normalized",
@@ -882,7 +864,6 @@ def render_monthly_balance(data, filters):
         "returns_adjustments_qty",
         "net_change",
         "closing_balance",
-        "has_negative_closing_balance",
     ]
 
     existing_cols = [col for col in display_cols if col in filtered.columns]

@@ -1302,7 +1302,7 @@ def render_containers(data, filters):
 
         references = int(float(row.get("unique_references", 0) or 0))
 
-        return f"{ibum_id} | {kg:,.2f} kg | {files:,} archivos | {references:,} referencias"
+        return f"{ibum_id}" 
 
     real_header["container_display_label"] = real_header.apply(container_label, axis=1)
     label_to_ibum = real_header.set_index("container_display_label")["ibum_id"].to_dict()

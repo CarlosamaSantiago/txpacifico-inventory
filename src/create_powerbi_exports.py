@@ -282,52 +282,84 @@ def prepare_container_import_summary(df: pd.DataFrame) -> pd.DataFrame:
     return df.copy()
 
 
+def join_unique(values: pd.Series) -> str:
+    clean_values = [
+        str(value).strip()
+        for value in values
+        if not pd.isna(value) and str(value).strip()
+    ]
+
+    return " | ".join(sorted(set(clean_values)))
+
+
+def real_ibum_mask(df: pd.DataFrame) -> pd.Series:
+    if df.empty or "ibum_id" not in df.columns:
+        return pd.Series(False, index=df.index)
+
+    ibum = df["ibum_id"].fillna("").astype(str).str.strip()
+
+    return ibum.ne("") & ~ibum.str.upper().str.startswith("MISSING_IBUM::")
+
+
 def build_dim_container(container_header: pd.DataFrame, stock_movements: pd.DataFrame) -> pd.DataFrame:
     container_header = clean_text_columns(container_header)
+    output_columns = [
+        "container_key",
+        "ibum_id",
+        "source_files",
+        "first_movement_date",
+        "last_movement_date",
+        "first_movement_month",
+        "last_movement_month",
+        "total_receipt_qty",
+        "unique_references",
+        "unique_product_keys",
+        "unique_colors",
+        "unique_lotrols",
+        "duplicate_lotrol_count",
+        "duplicate_qty_excluded",
+        "source_file_count",
+        "validation_status",
+    ]
 
     if container_header.empty:
         imports = stock_movements[
             stock_movements.get("movement_group", "").astype(str).str.upper().eq("IMPORT")
         ].copy() if "movement_group" in stock_movements.columns else pd.DataFrame()
 
+        imports = imports[real_ibum_mask(imports)].copy()
+
         if imports.empty:
-            return pd.DataFrame(
-                columns=[
-                    "container_key",
-                    "ibum_id",
-                    "source_file",
-                    "movement_date",
-                    "movement_month",
-                    "total_receipt_qty",
-                    "unique_references",
-                    "unique_product_keys",
-                    "unique_colors",
-                    "unique_lotrols",
-                    "duplicate_lotrol_count",
-                    "duplicate_qty_excluded",
-                    "has_missing_ibum",
-                    "validation_status",
-                ]
-            )
+            return pd.DataFrame(columns=output_columns)
+
+        imports["container_key"] = imports["ibum_id"]
 
         container_header = (
-            imports.groupby(["container_key", "ibum_id", "source_file"], dropna=False, as_index=False)
+            imports.groupby(["container_key", "ibum_id"], dropna=False, as_index=False)
             .agg(
-                movement_date=("movement_date", "min"),
-                movement_month=("movement_month", "min"),
+                source_files=("source_file", join_unique),
+                first_movement_date=("movement_date", "min"),
+                last_movement_date=("movement_date", "max"),
+                first_movement_month=("movement_month", "min"),
+                last_movement_month=("movement_month", "max"),
                 total_receipt_qty=("qty_in", "sum"),
                 unique_references=("reference", "nunique"),
                 unique_product_keys=("product_key", "nunique"),
                 unique_colors=("color_normalized", "nunique"),
                 unique_lotrols=("lotrol", "nunique"),
+                source_file_count=("source_file", "nunique"),
             )
         )
         container_header["duplicate_lotrol_count"] = 0
         container_header["duplicate_qty_excluded"] = 0.0
-        container_header["has_missing_ibum"] = container_header["ibum_id"].eq("")
-        container_header["validation_status"] = container_header["has_missing_ibum"].map(
-            {True: "WARNING_MISSING_IBUM", False: "OK"}
-        )
+        container_header["validation_status"] = "OK"
+
+    container_header = container_header[real_ibum_mask(container_header)].copy()
+
+    if container_header.empty:
+        return pd.DataFrame(columns=output_columns)
+
+    container_header["container_key"] = container_header["ibum_id"]
 
     numeric_cols = [
         "total_receipt_qty",
@@ -337,18 +369,18 @@ def build_dim_container(container_header: pd.DataFrame, stock_movements: pd.Data
         "unique_lotrols",
         "duplicate_lotrol_count",
         "duplicate_qty_excluded",
+        "source_file_count",
     ]
 
     for col in numeric_cols:
         if col in container_header.columns:
             container_header[col] = to_number(container_header[col])
 
-    if "has_missing_ibum" in container_header.columns:
-        container_header["has_missing_ibum"] = (
-            container_header["has_missing_ibum"].astype(str).str.upper().isin(["TRUE", "1", "YES"])
-        )
+    for column in output_columns:
+        if column not in container_header.columns:
+            container_header[column] = ""
 
-    return container_header.sort_values(["movement_month", "container_key"])
+    return container_header[output_columns].sort_values(["first_movement_month", "container_key"])
 
 
 def build_exceptions_table() -> pd.DataFrame:

@@ -55,6 +55,8 @@ MOVEMENT_SUPPORT_COLUMNS = [
 IMPORT_COLUMNS = [
     "ibum_id",
     "container_key",
+    "source_files",
+    "movement_months",
     "source_file",
     "movement_date",
     "movement_month",
@@ -77,9 +79,11 @@ IMPORT_COLUMNS = [
 CONTAINER_COLUMNS = [
     "container_key",
     "ibum_id",
-    "source_file",
-    "movement_date",
-    "movement_month",
+    "source_files",
+    "first_movement_date",
+    "last_movement_date",
+    "first_movement_month",
+    "last_movement_month",
     "total_receipt_qty",
     "unique_references",
     "unique_product_keys",
@@ -87,6 +91,7 @@ CONTAINER_COLUMNS = [
     "unique_lotrols",
     "duplicate_lotrol_count",
     "duplicate_qty_excluded",
+    "source_file_count",
     "has_missing_ibum",
     "validation_status",
 ]
@@ -154,15 +159,18 @@ def safe_filename(text: str) -> str:
 
 def build_export_filename(filters: dict, suffix: str = "xlsx") -> str:
     labels = filters.get("selected_product_labels") or []
+    descriptions = filters.get("selected_descriptions") or []
     references = filters.get("selected_references") or []
     colors = filters.get("selected_colors") or []
 
     if len(labels) == 1:
         token = safe_filename(labels[0])
-    elif len(references) == 1 and len(colors) <= 1 and not labels:
+    elif len(descriptions) == 1 and not labels and not references and not colors:
+        token = safe_filename(descriptions[0])
+    elif len(references) == 1 and len(colors) <= 1 and not labels and not descriptions:
         token_parts = references + colors
         token = safe_filename("_".join(token_parts))
-    elif len(colors) == 1 and not labels and not references:
+    elif len(colors) == 1 and not labels and not descriptions and not references:
         token = safe_filename(colors[0])
     else:
         token = "FILTRADO"
@@ -174,6 +182,7 @@ def is_export_unfiltered(filters: dict) -> bool:
     return not any(
         [
             filters.get("selected_product_keys"),
+            filters.get("selected_descriptions"),
             filters.get("selected_references"),
             filters.get("selected_colors"),
             str(filters.get("quick_search", "") or "").strip(),
@@ -336,6 +345,7 @@ def build_export_metadata(
     return {
         "generated_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "selected_product_labels": " | ".join(filters.get("selected_product_labels") or []),
+        "selected_descriptions": " | ".join(filters.get("selected_descriptions") or []),
         "selected_references": " | ".join(filters.get("selected_references") or []),
         "selected_colors": " | ".join(filters.get("selected_colors") or []),
         "quick_search": filters.get("quick_search", ""),

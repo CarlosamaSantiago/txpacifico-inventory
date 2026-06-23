@@ -43,6 +43,21 @@ FILES = {
     "inventory_exceptions": POWERBI_DATASET_DIR / "fact_inventory_exceptions.csv",
 }
 
+ARTIFACT_SOURCES = {
+    "stock_movements": [
+        FILES["stock_movements"],
+        POWERBI_DATASET_DIR / "fact_stock_movements.csv",
+    ],
+    "container_import_summary": [
+        FILES["container_import_summary"],
+        POWERBI_DATASET_DIR / "fact_container_import_summary.csv",
+    ],
+    "container_import_header": [
+        FILES["container_import_header"],
+        POWERBI_DATASET_DIR / "dim_container.csv",
+    ],
+}
+
 
 def to_number(series: pd.Series) -> pd.Series:
     def clean_value(value):
@@ -78,6 +93,21 @@ def read_csv(path: Path) -> pd.DataFrame:
         return pd.DataFrame()
 
     return pd.read_csv(path, dtype=str, encoding="utf-8-sig")
+
+
+def read_first_available(paths: list[Path]) -> tuple[pd.DataFrame, str]:
+    for path in paths:
+        df = read_csv(path)
+
+        if not df.empty:
+            try:
+                label = str(path.relative_to(PROJECT_ROOT))
+            except ValueError:
+                label = str(path)
+
+            return df, label
+
+    return pd.DataFrame(), ""
 
 
 def prepare_company_summary(df: pd.DataFrame) -> pd.DataFrame:
@@ -203,6 +233,7 @@ def prepare_container_table(df: pd.DataFrame) -> pd.DataFrame:
         "unique_colors",
         "duplicate_lotrol_count",
         "duplicate_qty_excluded",
+        "source_file_count",
     ]
 
     for col in numeric_cols:
@@ -214,104 +245,6 @@ def prepare_container_table(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = df[col].fillna("").astype(str).str.strip()
 
     return df
-
-
-def build_container_tables_from_movements(stock_movements: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    if stock_movements.empty:
-        return pd.DataFrame(), pd.DataFrame()
-
-    movements = stock_movements.copy()
-
-    if "movement_group" in movements.columns:
-        import_mask = movements["movement_group"].fillna("").astype(str).str.upper().eq("IMPORT")
-    elif "movement_type" in movements.columns:
-        import_mask = movements["movement_type"].fillna("").astype(str).str.upper().eq("CONTAINER_RECEIPT")
-    elif "movement_source" in movements.columns:
-        import_mask = movements["movement_source"].fillna("").astype(str).str.lower().eq("receipts")
-    else:
-        return pd.DataFrame(), pd.DataFrame()
-
-    imports = movements[import_mask].copy()
-
-    if imports.empty:
-        return pd.DataFrame(), pd.DataFrame()
-
-    for column in [
-        "ibum_id",
-        "container_key",
-        "source_file",
-        "movement_date",
-        "movement_month",
-        "reference",
-        "description",
-        "color_original",
-        "color_normalized",
-        "product_key",
-        "lotrol",
-    ]:
-        if column not in imports.columns:
-            imports[column] = ""
-
-        imports[column] = imports[column].fillna("").astype(str).str.strip()
-
-    if "qty_in" not in imports.columns:
-        imports["qty_in"] = 0.0
-
-    imports["qty_in"] = to_number(imports["qty_in"])
-
-    missing_container_key = imports["container_key"].eq("")
-    imports.loc[missing_container_key & imports["ibum_id"].ne(""), "container_key"] = imports.loc[
-        missing_container_key & imports["ibum_id"].ne(""),
-        "ibum_id",
-    ]
-    imports.loc[imports["container_key"].eq(""), "container_key"] = (
-        "MISSING_IBUM::" + imports.loc[imports["container_key"].eq(""), "source_file"]
-    )
-
-    group_cols = [
-        "container_key",
-        "ibum_id",
-        "source_file",
-        "movement_month",
-        "reference",
-        "description",
-        "color_original",
-        "color_normalized",
-        "product_key",
-    ]
-
-    summary = (
-        imports.groupby(group_cols, dropna=False, as_index=False)
-        .agg(
-            movement_date=("movement_date", "min"),
-            receipt_qty=("qty_in", "sum"),
-            roll_count=("qty_in", "size"),
-            unique_lotrols=("lotrol", lambda values: values[values != ""].nunique()),
-        )
-        .sort_values(["movement_month", "container_key", "reference", "color_normalized"])
-    )
-    summary["duplicate_lotrols_excluded"] = 0
-    summary["validation_status"] = "REBUILT_FROM_STOCK_MOVEMENTS"
-
-    header = (
-        imports.groupby(["container_key", "ibum_id", "source_file"], dropna=False, as_index=False)
-        .agg(
-            movement_date=("movement_date", "min"),
-            movement_month=("movement_month", "min"),
-            total_receipt_qty=("qty_in", "sum"),
-            unique_references=("reference", "nunique"),
-            unique_product_keys=("product_key", "nunique"),
-            unique_colors=("color_normalized", "nunique"),
-            unique_lotrols=("lotrol", lambda values: values[values != ""].nunique()),
-        )
-        .sort_values(["movement_month", "container_key"])
-    )
-    header["duplicate_lotrol_count"] = 0
-    header["duplicate_qty_excluded"] = 0.0
-    header["has_missing_ibum"] = header["ibum_id"].eq("")
-    header["validation_status"] = "REBUILT_FROM_STOCK_MOVEMENTS"
-
-    return prepare_container_table(summary), prepare_container_table(header)
 
 
 def format_number(value: float) -> str:
@@ -455,26 +388,92 @@ def build_product_selector_options(data: dict) -> pd.DataFrame:
     ].sort_values(["reference", "description", "color_normalized"])
 
 
+def is_real_ibum_value(value) -> bool:
+    text = clean_display_value(value)
+    upper_text = text.upper()
+
+    return bool(text) and not upper_text.startswith("MISSING_IBUM::")
+
+
+def real_ibum_mask(df: pd.DataFrame) -> pd.Series:
+    if df.empty or "ibum_id" not in df.columns:
+        return pd.Series(False, index=df.index)
+
+    return df["ibum_id"].fillna("").astype(str).str.strip().apply(is_real_ibum_value)
+
+
+def import_movement_mask(df: pd.DataFrame) -> pd.Series:
+    if df.empty:
+        return pd.Series(False, index=df.index)
+
+    if "movement_group" in df.columns:
+        return df["movement_group"].fillna("").astype(str).str.upper().eq("IMPORT")
+
+    if "movement_type" in df.columns:
+        return df["movement_type"].fillna("").astype(str).str.upper().eq("CONTAINER_RECEIPT")
+
+    if "movement_source" in df.columns:
+        return df["movement_source"].fillna("").astype(str).str.lower().eq("receipts")
+
+    return pd.Series(False, index=df.index)
+
+
+def count_pipe_values(value) -> int:
+    return len([part for part in clean_display_value(value).split("|") if part.strip()])
+
+
+def check_deployment_artifacts(data: dict) -> list[str]:
+    warnings = []
+    artifact_sources = data.get("artifact_sources", {})
+    stock_movements = data.get("stock_movements", pd.DataFrame())
+    container_header = data.get("container_import_header", pd.DataFrame())
+    container_summary = data.get("container_import_summary", pd.DataFrame())
+
+    if container_header.empty:
+        warnings.append("No se encontro tabla oficial de encabezados IBUM.")
+
+    if container_summary.empty:
+        warnings.append("No se encontro tabla oficial de resumen IBUM.")
+
+    for column in ["ibum_id", "container_key"]:
+        if stock_movements.empty or column not in stock_movements.columns:
+            warnings.append(f"stock_movements no contiene la columna {column}.")
+
+    required_powerbi = [
+        POWERBI_DATASET_DIR / "dim_container.csv",
+        POWERBI_DATASET_DIR / "fact_container_import_summary.csv",
+        POWERBI_DATASET_DIR / "fact_stock_movements.csv",
+    ]
+
+    for path in required_powerbi:
+        if not path.exists():
+            warnings.append(f"Falta artefacto Power BI para despliegue: {path.relative_to(PROJECT_ROOT)}.")
+
+    for table_name in ["container_import_header", "container_import_summary", "stock_movements"]:
+        if not artifact_sources.get(table_name):
+            warnings.append(f"No se cargo ningun artefacto para {table_name}.")
+
+    return warnings
+
+
 def load_data():
     company_summary = prepare_company_summary(read_csv(FILES["company_summary"]))
     monthly_balance = prepare_inventory_table(read_csv(FILES["monthly_balance"]))
     current_inventory = prepare_inventory_table(read_csv(FILES["current_inventory"]))
     duplicate_lotrols = read_csv(FILES["duplicate_lotrols"])
     negative_alerts = prepare_inventory_table(read_csv(FILES["negative_alerts"]))
-    stock_movements = prepare_movements_table(read_csv(FILES["stock_movements"]))
-    container_import_summary = prepare_container_table(read_csv(FILES["container_import_summary"]))
-    container_import_header = prepare_container_table(read_csv(FILES["container_import_header"]))
+    stock_movements_raw, stock_movements_source = read_first_available(ARTIFACT_SOURCES["stock_movements"])
+    container_summary_raw, container_summary_source = read_first_available(
+        ARTIFACT_SOURCES["container_import_summary"]
+    )
+    container_header_raw, container_header_source = read_first_available(
+        ARTIFACT_SOURCES["container_import_header"]
+    )
+    stock_movements = prepare_movements_table(stock_movements_raw)
+    container_import_summary = prepare_container_table(container_summary_raw)
+    container_import_header = prepare_container_table(container_header_raw)
     product_master = read_csv(FILES["product_master"])
     inventory_exceptions = read_csv(FILES["inventory_exceptions"])
-
-    if container_import_summary.empty or container_import_header.empty:
-        fallback_summary, fallback_header = build_container_tables_from_movements(stock_movements)
-
-        if container_import_summary.empty:
-            container_import_summary = fallback_summary
-
-        if container_import_header.empty:
-            container_import_header = fallback_header
 
     data = {
         "company_summary": company_summary,
@@ -487,6 +486,11 @@ def load_data():
         "container_import_header": container_import_header,
         "product_master": product_master,
         "inventory_exceptions": inventory_exceptions,
+        "artifact_sources": {
+            "stock_movements": stock_movements_source,
+            "container_import_summary": container_summary_source,
+            "container_import_header": container_header_source,
+        },
     }
 
     product_selector = build_product_selector_options(data)
@@ -536,6 +540,15 @@ def render_sidebar(data):
         if not product_selector.empty and "product_display_label" in product_selector.columns
         else []
     )
+    descriptions = (
+        sorted(
+            value
+            for value in product_selector["description"].fillna("").astype(str).str.strip().unique().tolist()
+            if value
+        )
+        if not product_selector.empty and "description" in product_selector.columns
+        else []
+    )
 
     selected_month = st.sidebar.selectbox(
         "Inventory month",
@@ -566,6 +579,12 @@ def render_sidebar(data):
         if label in label_to_key
     ]
 
+    selected_descriptions = st.sidebar.multiselect(
+        "Descripcion / nombre de producto",
+        options=descriptions,
+        default=[],
+    )
+
     quick_search = st.sidebar.text_input(
         "Búsqueda rápida",
         value="",
@@ -588,6 +607,7 @@ def render_sidebar(data):
         "selected_month": selected_month,
         "selected_product_labels": selected_product_labels,
         "selected_product_keys": selected_product_keys,
+        "selected_descriptions": selected_descriptions,
         "quick_search": quick_search,
         "selected_references": selected_references,
         "selected_colors": selected_colors,
@@ -598,12 +618,17 @@ def apply_inventory_filters(df: pd.DataFrame, filters: dict) -> pd.DataFrame:
     filtered = df.copy()
 
     selected_product_keys = filters.get("selected_product_keys", [])
+    selected_descriptions = filters.get("selected_descriptions", [])
     selected_references = filters.get("selected_references", [])
     selected_colors = filters.get("selected_colors", [])
     quick_search = str(filters.get("quick_search", "") or "").strip()
 
     if selected_product_keys and "product_key" in filtered.columns:
         filtered = filtered[filtered["product_key"].isin(selected_product_keys)]
+
+    if selected_descriptions and "description" in filtered.columns:
+        descriptions = filtered["description"].fillna("").astype(str).str.strip()
+        filtered = filtered[descriptions.isin(selected_descriptions)]
 
     if selected_references and "reference" in filtered.columns:
         filtered = filtered[filtered["reference"].isin(selected_references)]
@@ -1191,70 +1216,190 @@ def render_containers(data, filters):
 
     st.subheader("Containers / IBUM")
 
-    if container_header.empty:
+    if container_header.empty or "ibum_id" not in container_header.columns:
         st.error(
-            "No se encontró información de contenedores/IBUM en este despliegue. "
-            "Verifica que data/processed/container_import_header.csv, "
-            "data/processed/container_import_summary.csv y stock_movements.csv estén incluidos "
-            "en el repositorio desplegado, o vuelve a desplegar el último commit con la pipeline ejecutada."
+            "No se encontraron tablas oficiales de IBUM en este despliegue. "
+            "Ejecuta la pipeline y asegurate de desplegar los archivos exportados de contenedores/IBUM. "
+            "No se crearan IBUMs falsos usando nombres de archivo."
         )
         return
 
-    if "validation_status" in container_header.columns and container_header["validation_status"].astype(str).str.contains(
-        "REBUILT_FROM_STOCK_MOVEMENTS",
-        na=False,
-    ).any():
-        st.warning(
-            "La tabla de contenedores fue reconstruida en memoria desde stock_movements.csv "
-            "porque los CSV de contenedores no estaban disponibles en el despliegue."
+    import_detail_all = stock_movements[import_movement_mask(stock_movements)].copy()
+
+    if not import_detail_all.empty and "ibum_id" in import_detail_all.columns:
+        missing_imports = import_detail_all[~real_ibum_mask(import_detail_all)].copy()
+
+        if not missing_imports.empty:
+            with st.expander("Archivos de importacion sin IBUM", expanded=False):
+                st.warning(
+                    "Estos archivos no se muestran como contenedores de negocio. "
+                    "Corrige la hoja IBUM en Excel y vuelve a ejecutar la pipeline."
+                )
+
+                if {"source_file", "qty_in", "lotrol"}.issubset(missing_imports.columns):
+                    missing_files = (
+                        missing_imports.groupby("source_file", dropna=False, as_index=False)
+                        .agg(
+                            receipt_qty=("qty_in", "sum"),
+                            unique_lotrols=(
+                                "lotrol",
+                                lambda values: values.fillna("")
+                                .astype(str)
+                                .str.strip()
+                                .replace("", pd.NA)
+                                .dropna()
+                                .nunique(),
+                            ),
+                        )
+                        .sort_values("source_file")
+                    )
+                else:
+                    missing_files = missing_imports
+
+                st.dataframe(missing_files, use_container_width=True, hide_index=True)
+
+    real_header = container_header[real_ibum_mask(container_header)].copy()
+
+    if real_header.empty:
+        st.error(
+            "No se encontraron IBUMs reales en las tablas oficiales. "
+            "No se mostraran nombres de archivo como contenedores."
         )
-
-    if not container_summary.empty and "container_key" in container_summary.columns:
-        visible_containers = set(container_summary["container_key"].dropna().astype(str))
-        container_header = container_header[
-            container_header["container_key"].fillna("").astype(str).isin(visible_containers)
-        ].copy()
-
-    if container_header.empty:
-        st.warning("No containers match the selected product filters.")
         return
 
-    st.dataframe(
-        container_header.sort_values(["movement_month", "container_key"]),
-        use_container_width=True,
-        hide_index=True,
-    )
+    visible_ibums = set()
 
-    container_options = container_header["container_key"].dropna().astype(str).tolist()
-    selected_container = st.selectbox("IBUM / container_key", options=container_options)
+    if not container_summary.empty and "ibum_id" in container_summary.columns:
+        visible_ibums.update(container_summary.loc[real_ibum_mask(container_summary), "ibum_id"].astype(str))
 
-    selected_header = container_header[container_header["container_key"] == selected_container]
+    if not import_detail_all.empty and "ibum_id" in import_detail_all.columns:
+        visible_ibums.update(import_detail_all.loc[real_ibum_mask(import_detail_all), "ibum_id"].astype(str))
 
-    if selected_header.empty:
+    if visible_ibums:
+        real_header = real_header[real_header["ibum_id"].astype(str).isin(visible_ibums)].copy()
+    elif any(
+        [
+            filters.get("selected_product_keys"),
+            filters.get("selected_descriptions"),
+            filters.get("selected_references"),
+            filters.get("selected_colors"),
+            str(filters.get("quick_search", "") or "").strip(),
+        ]
+    ):
+        real_header = real_header.iloc[0:0].copy()
+
+    if real_header.empty:
+        st.warning("No hay IBUMs reales que coincidan con los filtros seleccionados.")
         return
 
+    def container_label(row) -> str:
+        ibum_id = clean_display_value(row.get("ibum_id", ""))
+        kg = float(row.get("total_receipt_qty", 0) or 0)
+        files = int(float(row.get("source_file_count", 0) or 0))
+
+        if files == 0:
+            files = count_pipe_values(row.get("source_files", ""))
+
+        references = int(float(row.get("unique_references", 0) or 0))
+
+        return f"{ibum_id} | {kg:,.2f} kg | {files:,} archivos | {references:,} referencias"
+
+    real_header["container_display_label"] = real_header.apply(container_label, axis=1)
+    label_to_ibum = real_header.set_index("container_display_label")["ibum_id"].to_dict()
+
+    header_cols = [
+        "container_display_label",
+        "ibum_id",
+        "source_files",
+        "first_movement_date",
+        "last_movement_date",
+        "first_movement_month",
+        "last_movement_month",
+        "total_receipt_qty",
+        "unique_references",
+        "unique_product_keys",
+        "unique_colors",
+        "unique_lotrols",
+        "duplicate_lotrol_count",
+        "duplicate_qty_excluded",
+        "source_file_count",
+        "validation_status",
+    ]
+    existing_header_cols = [col for col in header_cols if col in real_header.columns]
+    header_display = real_header[existing_header_cols].copy()
+    sort_cols = [col for col in ["first_movement_month", "ibum_id"] if col in header_display.columns]
+
+    if sort_cols:
+        header_display = header_display.sort_values(sort_cols)
+
+    st.dataframe(header_display, use_container_width=True, hide_index=True)
+
+    selected_label = st.selectbox("IBUM", options=real_header["container_display_label"].tolist())
+    selected_ibum = label_to_ibum[selected_label]
+    selected_header = real_header[real_header["ibum_id"].astype(str) == selected_ibum]
     row = selected_header.iloc[0]
 
+    source_file_count = int(float(row.get("source_file_count", 0) or 0))
+
+    if source_file_count == 0:
+        source_file_count = count_pipe_values(row.get("source_files", ""))
+
     col1, col2, col3, col4, col5 = st.columns(5)
-    col1.metric("IBUM", row.get("ibum_id", "") or "MISSING")
-    col2.metric("Total kg imported", format_number(float(row.get("total_receipt_qty", 0) or 0)))
-    col3.metric("References", f"{int(float(row.get('unique_references', 0) or 0)):,}")
-    col4.metric("Colors", f"{int(float(row.get('unique_colors', 0) or 0)):,}")
-    col5.metric("Rolls", f"{int(float(row.get('unique_lotrols', 0) or 0)):,}")
+    col1.metric("IBUM", selected_ibum)
+    col2.metric("Kg importados", format_number(float(row.get("total_receipt_qty", 0) or 0)))
+    col3.metric("Archivos", f"{source_file_count:,}")
+    col4.metric("Referencias", f"{int(float(row.get('unique_references', 0) or 0)):,}")
+    col5.metric("LOTROLs", f"{int(float(row.get('unique_lotrols', 0) or 0)):,}")
 
-    selected_summary = container_summary[
-        container_summary["container_key"] == selected_container
-    ].copy() if not container_summary.empty else pd.DataFrame()
+    selected_import_detail = (
+        import_detail_all[import_detail_all["ibum_id"].astype(str) == selected_ibum].copy()
+        if not import_detail_all.empty and "ibum_id" in import_detail_all.columns
+        else pd.DataFrame()
+    )
 
-    st.subheader("Summary by reference/color")
+    st.subheader("Archivos origen")
+
+    if selected_import_detail.empty or "source_file" not in selected_import_detail.columns:
+        source_files_text = clean_display_value(row.get("source_files", ""))
+        source_file_rows = pd.DataFrame({"ibum_id": [selected_ibum], "source_files": [source_files_text]})
+    else:
+        source_file_rows = (
+            selected_import_detail.groupby("source_file", dropna=False, as_index=False)
+            .agg(
+                movement_date=("movement_date", "min"),
+                movement_month=("movement_month", "min"),
+                receipt_qty=("qty_in", "sum"),
+                unique_lotrols=(
+                    "lotrol",
+                    lambda values: values.fillna("")
+                    .astype(str)
+                    .str.strip()
+                    .replace("", pd.NA)
+                    .dropna()
+                    .nunique(),
+                ),
+            )
+            .sort_values(["movement_month", "source_file"])
+        )
+        source_file_rows.insert(0, "ibum_id", selected_ibum)
+
+    st.dataframe(source_file_rows, use_container_width=True, hide_index=True)
+
+    selected_summary = (
+        container_summary[container_summary["ibum_id"].astype(str) == selected_ibum].copy()
+        if not container_summary.empty and "ibum_id" in container_summary.columns
+        else pd.DataFrame()
+    )
+
+    st.subheader("Resumen por referencia/color")
+
     if selected_summary.empty:
-        st.warning("No container summary rows found for the selected container.")
+        st.warning("No se encontraron filas de resumen para este IBUM.")
     else:
         summary_cols = [
             "ibum_id",
-            "source_file",
-            "movement_date",
-            "movement_month",
+            "source_files",
+            "movement_months",
             "product_display_label",
             "reference",
             "description",
@@ -1270,13 +1415,10 @@ def render_containers(data, filters):
         existing_cols = [col for col in summary_cols if col in selected_summary.columns]
         st.dataframe(selected_summary[existing_cols], use_container_width=True, hide_index=True)
 
-    import_detail = stock_movements[
-        stock_movements["container_key"] == selected_container
-    ].copy() if not stock_movements.empty and "container_key" in stock_movements.columns else pd.DataFrame()
+    st.subheader("Registros por rollo / LOTROL")
 
-    st.subheader("Roll-level records")
-    if import_detail.empty:
-        st.warning("No roll-level import records found for the selected container.")
+    if selected_import_detail.empty:
+        st.warning("No se encontraron registros por rollo para este IBUM.")
     else:
         detail_cols = [
             "movement_date",
@@ -1295,23 +1437,25 @@ def render_containers(data, filters):
             "source_sheet",
             "source_row",
         ]
-        existing_cols = [col for col in detail_cols if col in import_detail.columns]
-        st.dataframe(
-            import_detail[existing_cols].sort_values(["reference", "color_normalized", "lotrol"]),
-            use_container_width=True,
-            hide_index=True,
-        )
+        existing_cols = [col for col in detail_cols if col in selected_import_detail.columns]
+        detail_display = selected_import_detail[existing_cols].copy()
+        sort_cols = [col for col in ["reference", "color_normalized", "lotrol"] if col in detail_display.columns]
 
-    st.subheader("Duplicated LOTROLs")
+        if sort_cols:
+            detail_display = detail_display.sort_values(sort_cols)
+
+        st.dataframe(detail_display, use_container_width=True, hide_index=True)
+
+    st.subheader("LOTROLs duplicados")
     duplicate_detail = pd.DataFrame()
 
-    if not duplicate_lotrols.empty and "container_key" in duplicate_lotrols.columns:
+    if not duplicate_lotrols.empty and "ibum_id" in duplicate_lotrols.columns:
         duplicate_detail = duplicate_lotrols[
-            duplicate_lotrols["container_key"].fillna("").astype(str) == selected_container
+            duplicate_lotrols["ibum_id"].fillna("").astype(str) == selected_ibum
         ].copy()
 
     if duplicate_detail.empty:
-        st.success("No duplicated LOTROLs found for this container.")
+        st.success("No se encontraron LOTROLs duplicados para este IBUM.")
     else:
         duplicate_cols = [
             "ibum_id",
@@ -1332,11 +1476,11 @@ def render_containers(data, filters):
         existing_cols = [col for col in duplicate_cols if col in duplicate_detail.columns]
         st.dataframe(duplicate_detail[existing_cols], use_container_width=True, hide_index=True)
 
-    if not import_detail.empty:
+    if not selected_import_detail.empty:
         st.download_button(
-            "Download selected container detail CSV",
-            data=to_csv_bytes(import_detail),
-            file_name=f"{selected_container.replace(':', '_')}_container_detail.csv",
+            "Descargar detalle del IBUM CSV",
+            data=to_csv_bytes(selected_import_detail),
+            file_name=f"{selected_ibum.replace(':', '_')}_container_detail.csv",
             mime="text/csv",
         )
 
@@ -1463,6 +1607,12 @@ def main():
 
     data = load_data()
     filters = render_sidebar(data)
+    deployment_warnings = check_deployment_artifacts(data)
+
+    if deployment_warnings:
+        with st.expander("Diagnostico de despliegue", expanded=False):
+            for warning in deployment_warnings:
+                st.warning(warning)
 
     tabs = st.tabs(
         [

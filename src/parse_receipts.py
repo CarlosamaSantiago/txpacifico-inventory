@@ -611,6 +611,16 @@ def deduplicate_receipts(raw_movements: pd.DataFrame) -> pd.DataFrame:
     ).reset_index(drop=True)
 
 
+def join_unique(values: pd.Series) -> str:
+    clean_values = [
+        str(value).strip()
+        for value in values
+        if not pd.isna(value) and str(value).strip()
+    ]
+
+    return " | ".join(sorted(set(clean_values)))
+
+
 def build_container_import_summary(
     official_movements: pd.DataFrame,
     duplicate_lotrols: pd.DataFrame,
@@ -618,8 +628,6 @@ def build_container_import_summary(
     group_cols = [
         "container_key",
         "ibum_id",
-        "source_file",
-        "movement_month",
         "reference",
         "description",
         "color_original",
@@ -630,7 +638,8 @@ def build_container_import_summary(
     summary = (
         official_movements.groupby(group_cols, dropna=False, as_index=False)
         .agg(
-            movement_date=("movement_date", "min"),
+            source_files=("source_file", join_unique),
+            movement_months=("movement_month", join_unique),
             receipt_qty=("qty_in", "sum"),
             roll_count=("qty_in", "size"),
             unique_lotrols=("lotrol", "nunique"),
@@ -671,9 +680,8 @@ def build_container_import_summary(
     ordered_cols = [
         "container_key",
         "ibum_id",
-        "source_file",
-        "movement_date",
-        "movement_month",
+        "source_files",
+        "movement_months",
         "reference",
         "description",
         "color_original",
@@ -687,7 +695,7 @@ def build_container_import_summary(
     ]
 
     return summary[ordered_cols].sort_values(
-        ["movement_month", "container_key", "reference", "color_normalized"]
+        ["container_key", "reference", "color_normalized"]
     )
 
 
@@ -695,18 +703,22 @@ def build_container_import_header(
     official_movements: pd.DataFrame,
     duplicate_lotrols: pd.DataFrame,
 ) -> pd.DataFrame:
-    group_cols = ["container_key", "ibum_id", "source_file"]
+    group_cols = ["container_key", "ibum_id"]
 
     header = (
         official_movements.groupby(group_cols, dropna=False, as_index=False)
         .agg(
-            movement_date=("movement_date", "min"),
-            movement_month=("movement_month", "min"),
+            source_files=("source_file", join_unique),
+            first_movement_date=("movement_date", "min"),
+            last_movement_date=("movement_date", "max"),
+            first_movement_month=("movement_month", "min"),
+            last_movement_month=("movement_month", "max"),
             total_receipt_qty=("qty_in", "sum"),
             unique_references=("reference", "nunique"),
             unique_product_keys=("product_key", "nunique"),
             unique_colors=("color_normalized", "nunique"),
             unique_lotrols=("lotrol", "nunique"),
+            source_file_count=("source_file", "nunique"),
         )
     )
 
@@ -753,9 +765,11 @@ def build_container_import_header(
     ordered_cols = [
         "container_key",
         "ibum_id",
-        "source_file",
-        "movement_date",
-        "movement_month",
+        "source_files",
+        "first_movement_date",
+        "last_movement_date",
+        "first_movement_month",
+        "last_movement_month",
         "total_receipt_qty",
         "unique_references",
         "unique_product_keys",
@@ -763,11 +777,12 @@ def build_container_import_header(
         "unique_lotrols",
         "duplicate_lotrol_count",
         "duplicate_qty_excluded",
+        "source_file_count",
         "has_missing_ibum",
         "validation_status",
     ]
 
-    return header[ordered_cols].sort_values(["movement_month", "container_key"])
+    return header[ordered_cols].sort_values(["first_movement_month", "container_key"])
 
 
 def main() -> None:

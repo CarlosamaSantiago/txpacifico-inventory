@@ -79,6 +79,21 @@ def almost_equal(left: float, right: float, tolerance: float = TOLERANCE) -> boo
     return abs(left - right) <= tolerance
 
 
+def real_ibum_mask(df: pd.DataFrame) -> pd.Series:
+    if df.empty or "ibum_id" not in df.columns:
+        return pd.Series(False, index=df.index)
+
+    ibum = df["ibum_id"].fillna("").astype(str).str.strip()
+
+    return ibum.ne("") & ~ibum.str.upper().str.startswith("MISSING_IBUM::")
+
+
+def looks_like_source_file(value) -> bool:
+    text = str(value or "").strip().lower()
+
+    return text.endswith((".xlsx", ".xls", ".csv"))
+
+
 def check_required_files() -> list[str]:
     errors = []
 
@@ -335,6 +350,72 @@ def validate_powerbi_exports() -> list[str]:
             errors.append(f"Power BI {table_name} is missing container_key.")
         if "ibum_id" not in df.columns:
             errors.append(f"Power BI {table_name} is missing ibum_id.")
+
+    required_container_cols = [
+        "source_files",
+        "total_receipt_qty",
+        "source_file_count",
+    ]
+    missing_dim_cols = [col for col in required_container_cols if col not in dim_container.columns]
+
+    if missing_dim_cols:
+        errors.append(f"Power BI dim_container.csv is missing columns: {missing_dim_cols}")
+
+    required_summary_cols = [
+        "source_files",
+        "receipt_qty",
+        "reference",
+        "color_normalized",
+        "product_key",
+    ]
+    missing_summary_cols = [col for col in required_summary_cols if col not in container_summary.columns]
+
+    if missing_summary_cols:
+        errors.append(
+            f"Power BI fact_container_import_summary.csv is missing columns: {missing_summary_cols}"
+        )
+
+    if {"ibum_id", "container_key"}.issubset(dim_container.columns):
+        real_dim = dim_container[real_ibum_mask(dim_container)].copy()
+
+        duplicate_ibums = real_dim["ibum_id"].fillna("").astype(str).str.strip().duplicated().sum()
+
+        if duplicate_ibums > 0:
+            errors.append(
+                f"Power BI dim_container.csv has {duplicate_ibums:,} duplicate real IBUM business rows."
+            )
+
+        fake_ibums = real_dim[
+            real_dim["ibum_id"].apply(looks_like_source_file)
+            | real_dim["container_key"].fillna("").astype(str).str.upper().str.startswith("MISSING_IBUM::")
+        ]
+
+        if not fake_ibums.empty:
+            errors.append("Power BI dim_container.csv contains file names or missing-IBUM keys as business IBUM rows.")
+
+        if {"movement_group", "qty_in", "ibum_id"}.issubset(stock.columns) and "total_receipt_qty" in real_dim.columns:
+            imports = stock[
+                stock["movement_group"].fillna("").astype(str).str.upper().eq("IMPORT")
+                & real_ibum_mask(stock)
+            ].copy()
+
+            if not imports.empty:
+                imports["qty_in"] = to_number(imports["qty_in"])
+                movement_totals = (
+                    imports.groupby("ibum_id", as_index=False)
+                    .agg(import_qty=("qty_in", "sum"))
+                )
+                dim_totals = real_dim[["ibum_id", "total_receipt_qty"]].copy()
+                dim_totals["total_receipt_qty"] = to_number(dim_totals["total_receipt_qty"])
+                comparison = dim_totals.merge(movement_totals, on="ibum_id", how="outer").fillna(0)
+                diff = (comparison["total_receipt_qty"] - comparison["import_qty"]).abs()
+                bad_totals = comparison[diff > TOLERANCE]
+
+                if not bad_totals.empty:
+                    errors.append(
+                        "Power BI dim_container.csv total_receipt_qty does not match "
+                        "fact_stock_movements import qty by real IBUM."
+                    )
 
     return errors
 

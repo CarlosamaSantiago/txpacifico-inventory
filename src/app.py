@@ -1308,7 +1308,6 @@ def render_containers(data, filters):
     label_to_ibum = real_header.set_index("container_display_label")["ibum_id"].to_dict()
 
     header_cols = [
-        "container_display_label",
         "ibum_id",
         "source_files",
         "first_movement_date",

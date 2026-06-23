@@ -556,18 +556,6 @@ def render_sidebar(data):
         index=len(months) - 1,
     )
 
-    label_to_key = (
-        product_selector.set_index("product_display_label")["product_key"].to_dict()
-        if not product_selector.empty
-        and {"product_display_label", "product_key"}.issubset(product_selector.columns)
-        else {}
-    )
-    selected_product_keys = [
-        label_to_key[label]
-        for label in selected_product_labels
-        if label in label_to_key
-    ]
-
     selected_descriptions = st.sidebar.multiselect(
         "Nombre de referencia",
         options=descriptions,
@@ -588,10 +576,7 @@ def render_sidebar(data):
 
     return {
         "selected_month": selected_month,
-        "selected_product_labels": selected_product_labels,
-        "selected_product_keys": selected_product_keys,
         "selected_descriptions": selected_descriptions,
-        "quick_search": quick_search,
         "selected_references": selected_references,
         "selected_colors": selected_colors,
     }

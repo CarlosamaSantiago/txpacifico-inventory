@@ -5,6 +5,7 @@ import pandas as pd
 
 COLUMN_LABELS_ES = {
     "movement_month": "Periodo",
+    "movement_months": "Periodo",
     "movement_date": "Fecha del registro",
     "reference": "Referencia",
     "description": "Descripcion",

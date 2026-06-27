@@ -2226,7 +2226,7 @@ def render_containers(data, filters):
                 selected_summary,
                 columns=[
                     "ibum_id",
-                    "reference",
+                    "movement_months",
                     "description",
                     "color_original",
                     "receipt_qty",

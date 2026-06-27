@@ -14,6 +14,7 @@ try:
         dataframe_to_csv_bytes,
         is_export_unfiltered,
     )
+    from ui_formatting import prepare_business_table
 except ModuleNotFoundError:
     from src.export_utils import (
         build_excel_report_bytes,
@@ -23,11 +24,32 @@ except ModuleNotFoundError:
         dataframe_to_csv_bytes,
         is_export_unfiltered,
     )
+    from src.ui_formatting import prepare_business_table
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 POWERBI_DATASET_DIR = PROJECT_ROOT / "reports" / "powerbi" / "dataset"
+
+INVENTORY_NUMERIC_COLUMNS = [
+    "opening_balance",
+    "opening_stock_qty",
+    "imports_qty",
+    "sales_qty",
+    "returns_adjustments_qty",
+    "net_change",
+    "closing_balance",
+]
+
+MOVEMENT_NUMERIC_COLUMNS = [
+    "qty_in",
+    "qty_out",
+    "net_qty",
+    "receipt_qty",
+    "total_receipt_qty",
+    "duplicate_qty_excluded",
+    "duplicate_lotrols_excluded",
+]
 
 
 FILES = {
@@ -514,17 +536,17 @@ def load_data():
 
 def render_header():
     st.set_page_config(
-        page_title="TXP Inventory Dashboard",
+        page_title="TXP Inventario",
         page_icon="📦",
         layout="wide",
     )
 
-    st.title("📦 TXP Inventory Dashboard")
-    st.caption("Inventory tracking from opening stock, import receipts, and sales reports.")
+    st.title("📦 Tablero de Inventario TXP")
+    st.caption("Seguimiento de inventario inicial, importaciones por contenedor y ventas.")
 
 
 def render_sidebar(data):
-    st.sidebar.title("Filters")
+    st.sidebar.title("Filtros")
 
     monthly_balance = data["monthly_balance"]
     product_selector = data.get("product_selector", pd.DataFrame())
@@ -551,13 +573,36 @@ def render_sidebar(data):
     )
 
     selected_month = st.sidebar.selectbox(
-        "Inventory month",
+        "Periodo de inventario",
         options=months,
         index=len(months) - 1,
     )
 
+    st.sidebar.caption(
+        "Puedes buscar por codigo, nombre de referencia o color. "
+        "Ejemplo: 070101, QATAR, PERUANA, PALO DE ROSA."
+    )
+
+    selected_product_labels = st.sidebar.multiselect(
+        "Buscar referencia / producto / color",
+        options=product_labels,
+        default=[],
+    )
+
+    label_to_key = (
+        product_selector.set_index("product_display_label")["product_key"].to_dict()
+        if not product_selector.empty
+        and {"product_display_label", "product_key"}.issubset(product_selector.columns)
+        else {}
+    )
+    selected_product_keys = [
+        label_to_key[label]
+        for label in selected_product_labels
+        if label in label_to_key
+    ]
+
     selected_descriptions = st.sidebar.multiselect(
-        "Nombre de referencia",
+        "Descripcion / nombre de producto",
         options=descriptions,
         default=[],
     )
@@ -574,11 +619,20 @@ def render_sidebar(data):
         default=[],
     )
 
+    quick_search = st.sidebar.text_input(
+        "Busqueda rapida",
+        value="",
+        placeholder="qatar palo",
+    )
+
     return {
         "selected_month": selected_month,
+        "selected_product_labels": selected_product_labels,
+        "selected_product_keys": selected_product_keys,
         "selected_descriptions": selected_descriptions,
         "selected_references": selected_references,
         "selected_colors": selected_colors,
+        "quick_search": quick_search,
     }
 
 
@@ -1567,6 +1621,821 @@ def render_export_report(data, filters):
         st.dataframe(preview_table.head(100), use_container_width=True, hide_index=True)
 
 
+def sort_existing(df: pd.DataFrame, columns: list[str], ascending=True) -> pd.DataFrame:
+    sort_cols = [column for column in columns if column in df.columns]
+
+    if not sort_cols:
+        return df
+
+    return df.sort_values(sort_cols, ascending=ascending)
+
+
+def show_technical_columns(df: pd.DataFrame, key: str) -> None:
+    if df.empty:
+        return
+
+    with st.expander("Ver detalles tecnicos", expanded=False):
+        st.dataframe(df, use_container_width=True, hide_index=True, key=key)
+
+
+def render_overview(data, filters):
+    company_summary = data["company_summary"]
+    monthly_balance = data["monthly_balance"]
+    duplicate_lotrols = data["duplicate_lotrols"]
+
+    selected_month = filters.get("selected_month")
+
+    if company_summary.empty or monthly_balance.empty:
+        st.error("No se encontraron archivos procesados de inventario. Ejecuta la pipeline primero.")
+        st.code(r".\.venv\Scripts\python.exe src\run_pipeline.py")
+        return
+
+    month_inventory = monthly_balance[monthly_balance["movement_month"] == selected_month].copy()
+    month_inventory = apply_inventory_filters(month_inventory, filters)
+
+    closing_stock = month_inventory["closing_balance"].sum()
+    imports_qty = month_inventory["imports_qty"].sum()
+    sales_qty = month_inventory["sales_qty"].sum()
+    returns_qty = month_inventory["returns_adjustments_qty"].sum()
+    negative_count = month_inventory[month_inventory["closing_balance"] < -0.0001]["product_key"].nunique()
+    duplicate_count = (
+        duplicate_lotrols["lotrol"].nunique()
+        if not duplicate_lotrols.empty and "lotrol" in duplicate_lotrols.columns
+        else 0
+    )
+
+    st.subheader(f"Resumen de inventario - {selected_month}")
+
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
+    col1.metric("Saldo final", format_number(closing_stock))
+    col2.metric("Importaciones", format_number(imports_qty))
+    col3.metric("Ventas", format_number(sales_qty))
+    col4.metric("Devoluciones / ajustes", format_number(returns_qty))
+    col5.metric("Items negativos", f"{negative_count:,}")
+    col6.metric("LOTROLs duplicados", f"{duplicate_count:,}")
+
+    st.divider()
+
+    filtered_all_months = apply_inventory_filters(monthly_balance, filters)
+
+    has_product_filter = any(
+        [
+            filters.get("selected_product_keys"),
+            filters.get("selected_descriptions"),
+            filters.get("selected_references"),
+            filters.get("selected_colors"),
+            str(filters.get("quick_search", "") or "").strip(),
+        ]
+    )
+
+    if has_product_filter:
+        company_filtered = (
+            filtered_all_months.groupby("movement_month", as_index=False)
+            .agg(
+                opening_balance=("opening_balance", "sum"),
+                opening_stock_qty=("opening_stock_qty", "sum"),
+                imports_qty=("imports_qty", "sum"),
+                sales_qty=("sales_qty", "sum"),
+                returns_adjustments_qty=("returns_adjustments_qty", "sum"),
+                net_change=("net_change", "sum"),
+                closing_balance=("closing_balance", "sum"),
+            )
+        )
+    else:
+        company_filtered = company_summary.copy()
+
+    fig_stock = px.line(
+        company_filtered,
+        x="movement_month",
+        y="closing_balance",
+        markers=True,
+        title="Saldo final de inventario por periodo",
+        labels={"movement_month": "Periodo", "closing_balance": "Saldo final kg"},
+    )
+    st.plotly_chart(fig_stock, use_container_width=True)
+
+    col_left, col_right = st.columns(2)
+    movement_df = company_filtered[
+        ["movement_month", "imports_qty", "sales_qty", "returns_adjustments_qty"]
+    ].melt(id_vars="movement_month", var_name="movement", value_name="quantity")
+    movement_df["movement"] = movement_df["movement"].map(
+        {
+            "imports_qty": "Importaciones",
+            "sales_qty": "Ventas",
+            "returns_adjustments_qty": "Devoluciones / ajustes",
+        }
+    )
+
+    fig_movements = px.bar(
+        movement_df,
+        x="movement_month",
+        y="quantity",
+        color="movement",
+        barmode="group",
+        title="Importaciones, ventas y devoluciones por periodo",
+        labels={"movement_month": "Periodo", "quantity": "Kg", "movement": "Movimiento"},
+    )
+    col_left.plotly_chart(fig_movements, use_container_width=True)
+
+    top_inventory = (
+        month_inventory.groupby(["reference", "description"], as_index=False)
+        .agg(closing_balance=("closing_balance", "sum"))
+        .sort_values("closing_balance", ascending=False)
+        .head(15)
+    )
+    fig_top = px.bar(
+        top_inventory,
+        x="closing_balance",
+        y="reference",
+        orientation="h",
+        hover_data=["description"],
+        title="Top 15 referencias por saldo final",
+        labels={"closing_balance": "Saldo final kg", "reference": "Referencia", "description": "Descripcion"},
+    )
+    col_right.plotly_chart(fig_top, use_container_width=True)
+
+    st.subheader("Inventario actual por referencia/color")
+    display = prepare_business_table(
+        month_inventory.sort_values("closing_balance", ascending=False),
+        columns=[
+            "reference",
+            "description",
+            "color_original",
+            "opening_balance",
+            "imports_qty",
+            "sales_qty",
+            "returns_adjustments_qty",
+            "closing_balance",
+        ],
+        numeric_columns=INVENTORY_NUMERIC_COLUMNS,
+    )
+    st.dataframe(display, use_container_width=True, hide_index=True)
+    show_technical_columns(month_inventory, "overview_technical")
+
+
+def render_monthly_balance(data, filters):
+    monthly_balance = data["monthly_balance"]
+
+    if monthly_balance.empty:
+        st.error("No se encontro monthly_inventory_balance.csv.")
+        return
+
+    filtered = apply_inventory_filters(monthly_balance, filters)
+    st.subheader("Balance mensual de inventario")
+
+    display = prepare_business_table(
+        sort_existing(filtered, ["movement_month", "reference", "color_normalized"]),
+        columns=[
+            "movement_month",
+            "reference",
+            "description",
+            "color_original",
+            "opening_balance",
+            "opening_stock_qty",
+            "imports_qty",
+            "sales_qty",
+            "returns_adjustments_qty",
+            "net_change",
+            "closing_balance",
+        ],
+        numeric_columns=INVENTORY_NUMERIC_COLUMNS,
+    )
+    st.dataframe(display, use_container_width=True, hide_index=True)
+    show_technical_columns(filtered, "monthly_technical")
+
+
+def render_duplicates(data, filters):
+    duplicate_lotrols = apply_inventory_filters(data["duplicate_lotrols"], filters)
+
+    st.subheader("LOTROLs duplicados")
+
+    if duplicate_lotrols.empty:
+        st.success("No se encontraron LOTROLs duplicados.")
+        return
+
+    st.warning(f"Se encontraron {duplicate_lotrols['lotrol'].nunique():,} LOTROLs duplicados.")
+    display = prepare_business_table(
+        duplicate_lotrols,
+        columns=[
+            "lotrol",
+            "reference",
+            "description",
+            "color_original",
+            "ibum_id",
+            "qty_in",
+            "duplicate_qty_excluded",
+            "source_file",
+            "source_row",
+            "validation_status",
+        ],
+        numeric_columns=MOVEMENT_NUMERIC_COLUMNS,
+    )
+    st.dataframe(display, use_container_width=True, hide_index=True)
+    show_technical_columns(duplicate_lotrols, "duplicates_technical")
+
+
+def render_negative_alerts(data, filters):
+    negative_alerts = apply_inventory_filters(data["negative_alerts"], filters)
+
+    st.subheader("Inventario negativo")
+
+    if negative_alerts.empty:
+        st.success("No se encontraron alertas de inventario negativo.")
+        return
+
+    st.error(f"Se encontraron {len(negative_alerts):,} filas con inventario negativo.")
+    display = prepare_business_table(
+        negative_alerts,
+        columns=[
+            "movement_month",
+            "reference",
+            "description",
+            "color_original",
+            "opening_balance",
+            "imports_qty",
+            "sales_qty",
+            "returns_adjustments_qty",
+            "closing_balance",
+        ],
+        numeric_columns=INVENTORY_NUMERIC_COLUMNS,
+    )
+    st.dataframe(display, use_container_width=True, hide_index=True)
+    show_technical_columns(negative_alerts, "negative_technical")
+
+
+def render_traceability(data, filters):
+    monthly_balance = apply_inventory_filters(data["monthly_balance"], filters)
+    stock_movements = apply_inventory_filters(data["stock_movements"], filters)
+    product_selector = data.get("product_selector", pd.DataFrame())
+
+    st.subheader("Trazabilidad")
+
+    if monthly_balance.empty or stock_movements.empty:
+        st.error("No se encontraron datos de trazabilidad. Ejecuta la pipeline primero.")
+        return
+
+    st.info(
+        "Las ventas disponibles actualmente vienen agregadas por reporte mensual, referencia y color. "
+        "Por eso la trazabilidad de ventas llega hasta la fila del reporte de ventas, no hasta factura, "
+        "cliente o rollo individual."
+    )
+
+    references = ["ALL"] + non_empty_options(monthly_balance, "reference")
+    colors = ["ALL"] + non_empty_options(monthly_balance, "color_normalized")
+    available_product_keys = set(non_empty_options(monthly_balance, "product_key"))
+    available_products = (
+        product_selector[product_selector["product_key"].isin(available_product_keys)].copy()
+        if not product_selector.empty and "product_key" in product_selector.columns
+        else pd.DataFrame()
+    )
+    product_labels = ["ALL"] + (
+        available_products["product_display_label"].tolist()
+        if not available_products.empty and "product_display_label" in available_products.columns
+        else non_empty_options(monthly_balance, "product_display_label")
+    )
+    label_to_key = (
+        available_products.set_index("product_display_label")["product_key"].to_dict()
+        if not available_products.empty
+        and {"product_display_label", "product_key"}.issubset(available_products.columns)
+        else {}
+    )
+    movement_groups = ["ALL", "OPENING", "IMPORT", "SALE"]
+
+    col1, col2, col3, col4 = st.columns(4)
+    selected_reference = col1.selectbox("Referencia", options=references, key="trace_reference")
+    selected_color = col2.selectbox("Color", options=colors, key="trace_color")
+    selected_product_label = col3.selectbox("Producto seleccionado", options=product_labels, key="trace_product_label")
+    selected_product_key = "ALL" if selected_product_label == "ALL" else label_to_key.get(selected_product_label, "ALL")
+    selected_movement_group = col4.selectbox(
+        "Grupo de movimiento",
+        options=movement_groups,
+        format_func=movement_group_label,
+        key="trace_movement_group",
+    )
+
+    filtered_monthly = apply_traceability_filters(
+        monthly_balance,
+        reference=selected_reference,
+        color=selected_color,
+        product_key=selected_product_key,
+    )
+
+    if filtered_monthly.empty:
+        st.warning("No hay balance mensual para los filtros seleccionados.")
+        return
+
+    monthly_matrix = (
+        filtered_monthly.groupby("movement_month", as_index=False)
+        .agg(
+            opening_balance=("opening_balance", "sum"),
+            imports_qty=("imports_qty", "sum"),
+            sales_qty=("sales_qty", "sum"),
+            returns_adjustments_qty=("returns_adjustments_qty", "sum"),
+            net_change=("net_change", "sum"),
+            closing_balance=("closing_balance", "sum"),
+        )
+        .sort_values("movement_month")
+    )
+    matrix_display = prepare_business_table(
+        monthly_matrix,
+        columns=[
+            "movement_month",
+            "opening_balance",
+            "imports_qty",
+            "sales_qty",
+            "returns_adjustments_qty",
+            "net_change",
+            "closing_balance",
+        ],
+        numeric_columns=INVENTORY_NUMERIC_COLUMNS,
+    )
+    st.dataframe(matrix_display, use_container_width=True, hide_index=True)
+
+    fig = px.line(
+        monthly_matrix,
+        x="movement_month",
+        y="closing_balance",
+        markers=True,
+        title="Saldo final por periodo",
+        labels={"movement_month": "Periodo", "closing_balance": "Saldo final kg"},
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.download_button(
+        "Descargar balance mensual filtrado CSV",
+        data=to_csv_bytes(monthly_matrix),
+        file_name="balance_mensual_trazabilidad.csv",
+        mime="text/csv",
+    )
+
+    st.divider()
+    st.subheader("Registros soporte")
+
+    month_options = ["ALL"] + monthly_matrix["movement_month"].tolist()
+    detail_month = st.selectbox("Periodo seleccionado", options=month_options, key="trace_detail_month")
+    detail_group = st.selectbox(
+        "Grupo de movimiento seleccionado",
+        options=movement_groups,
+        format_func=movement_group_label,
+        key="trace_detail_group",
+    )
+
+    effective_group = selected_movement_group if selected_movement_group != "ALL" else detail_group
+    detail = apply_traceability_filters(
+        stock_movements,
+        reference=selected_reference,
+        color=selected_color,
+        product_key=selected_product_key,
+        movement_group=effective_group,
+    )
+
+    if detail_month != "ALL" and "movement_month" in detail.columns:
+        detail = detail[detail["movement_month"] == detail_month]
+
+    if detail.empty:
+        st.warning("No hay registros soporte para los filtros seleccionados.")
+        return
+
+    detail = detail.copy()
+    if "movement_group" in detail.columns:
+        detail["movement_type"] = detail["movement_group"].map(
+            {
+                "OPENING": "Inventario inicial",
+                "IMPORT": "Importacion",
+                "SALE": "Venta",
+            }
+        ).fillna(detail.get("movement_type", ""))
+
+    display = prepare_business_table(
+        sort_existing(detail, ["movement_month", "movement_group", "source_file", "source_row"]),
+        columns=[
+            "movement_month",
+            "movement_date",
+            "movement_type",
+            "reference",
+            "description",
+            "color_original",
+            "ibum_id",
+            "lot",
+            "roll",
+            "lotrol",
+            "qty_in",
+            "qty_out",
+            "net_qty",
+            "source_file",
+            "source_row",
+            "validation_status",
+        ],
+        numeric_columns=MOVEMENT_NUMERIC_COLUMNS,
+    )
+    st.dataframe(display, use_container_width=True, hide_index=True)
+    show_technical_columns(detail, "traceability_technical")
+
+    st.download_button(
+        "Descargar registros soporte CSV",
+        data=to_csv_bytes(detail),
+        file_name="registros_soporte_filtrados.csv",
+        mime="text/csv",
+    )
+
+
+def render_containers(data, filters):
+    container_header = data["container_import_header"]
+    container_summary = apply_inventory_filters(data["container_import_summary"], filters)
+    stock_movements = apply_inventory_filters(data["stock_movements"], filters)
+    duplicate_lotrols = apply_inventory_filters(data["duplicate_lotrols"], filters)
+
+    st.subheader("Contenedores / IBUM")
+
+    if container_header.empty or "ibum_id" not in container_header.columns:
+        st.error(
+            "No se encontraron tablas oficiales de IBUM en este despliegue. "
+            "Ejecuta la pipeline y asegurate de desplegar los archivos exportados de contenedores/IBUM. "
+            "No se crearan IBUMs falsos usando nombres de archivo."
+        )
+        return
+
+    import_detail_all = stock_movements[import_movement_mask(stock_movements)].copy()
+
+    if not import_detail_all.empty and "ibum_id" in import_detail_all.columns:
+        missing_imports = import_detail_all[~real_ibum_mask(import_detail_all)].copy()
+
+        if not missing_imports.empty:
+            with st.expander("Archivos de importacion sin IBUM", expanded=False):
+                st.warning(
+                    "Estos archivos no se muestran como contenedores de negocio. "
+                    "Corrige la hoja IBUM en Excel y vuelve a ejecutar la pipeline."
+                )
+                if {"source_file", "qty_in", "lotrol"}.issubset(missing_imports.columns):
+                    missing_files = (
+                        missing_imports.groupby("source_file", dropna=False, as_index=False)
+                        .agg(
+                            receipt_qty=("qty_in", "sum"),
+                            unique_lotrols=(
+                                "lotrol",
+                                lambda values: values.fillna("")
+                                .astype(str)
+                                .str.strip()
+                                .replace("", pd.NA)
+                                .dropna()
+                                .nunique(),
+                            ),
+                        )
+                        .sort_values("source_file")
+                    )
+                else:
+                    missing_files = missing_imports
+
+                st.dataframe(
+                    prepare_business_table(
+                        missing_files,
+                        columns=["source_file", "receipt_qty", "unique_lotrols"],
+                        numeric_columns=["receipt_qty"],
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                show_technical_columns(missing_imports, "containers_missing_ibum_technical")
+
+    real_header = container_header[real_ibum_mask(container_header)].copy()
+
+    if real_header.empty:
+        st.error("No se encontraron IBUMs reales en las tablas oficiales.")
+        return
+
+    visible_ibums = set()
+
+    if not container_summary.empty and "ibum_id" in container_summary.columns:
+        visible_ibums.update(container_summary.loc[real_ibum_mask(container_summary), "ibum_id"].astype(str))
+
+    if not import_detail_all.empty and "ibum_id" in import_detail_all.columns:
+        visible_ibums.update(import_detail_all.loc[real_ibum_mask(import_detail_all), "ibum_id"].astype(str))
+
+    if visible_ibums:
+        real_header = real_header[real_header["ibum_id"].astype(str).isin(visible_ibums)].copy()
+    elif any(
+        [
+            filters.get("selected_product_keys"),
+            filters.get("selected_descriptions"),
+            filters.get("selected_references"),
+            filters.get("selected_colors"),
+            str(filters.get("quick_search", "") or "").strip(),
+        ]
+    ):
+        real_header = real_header.iloc[0:0].copy()
+
+    if real_header.empty:
+        st.warning("No hay IBUMs reales que coincidan con los filtros seleccionados.")
+        return
+
+    real_header["container_display_label"] = real_header["ibum_id"].fillna("").astype(str).str.strip()
+    label_to_ibum = real_header.set_index("container_display_label")["ibum_id"].to_dict()
+
+    header_display = prepare_business_table(
+        sort_existing(real_header, ["first_movement_month", "ibum_id"]),
+        columns=[
+            "ibum_id",
+            "first_movement_date",
+            "last_movement_date",
+            "total_receipt_qty",
+            "source_files",
+            "source_file_count",
+            "unique_references",
+            "unique_colors",
+            "unique_lotrols",
+            "duplicate_lotrol_count",
+            "duplicate_qty_excluded",
+            "validation_status",
+        ],
+        numeric_columns=[
+            "total_receipt_qty",
+            "duplicate_qty_excluded",
+        ],
+    )
+    st.dataframe(header_display, use_container_width=True, hide_index=True)
+
+    selected_label = st.selectbox("IBUM", options=real_header["container_display_label"].tolist())
+    selected_ibum = label_to_ibum[selected_label]
+    selected_header = real_header[real_header["ibum_id"].astype(str) == selected_ibum]
+    row = selected_header.iloc[0]
+
+    source_file_count = int(float(row.get("source_file_count", 0) or 0))
+
+    if source_file_count == 0:
+        source_file_count = count_pipe_values(row.get("source_files", ""))
+
+    col1, col2, col3, col4, col5 = st.columns(5)
+    col1.metric("IBUM", selected_ibum)
+    col2.metric("Kg importados", format_number(float(row.get("total_receipt_qty", 0) or 0)))
+    col3.metric("Archivos", f"{source_file_count:,}")
+    col4.metric("Referencias", f"{int(float(row.get('unique_references', 0) or 0)):,}")
+    col5.metric("LOTROLs", f"{int(float(row.get('unique_lotrols', 0) or 0)):,}")
+
+    selected_import_detail = (
+        import_detail_all[import_detail_all["ibum_id"].astype(str) == selected_ibum].copy()
+        if not import_detail_all.empty and "ibum_id" in import_detail_all.columns
+        else pd.DataFrame()
+    )
+
+    st.subheader("Archivos origen")
+    if selected_import_detail.empty or "source_file" not in selected_import_detail.columns:
+        source_file_rows = pd.DataFrame({"ibum_id": [selected_ibum], "source_files": [row.get("source_files", "")]})
+    else:
+        source_file_rows = (
+            selected_import_detail.groupby("source_file", dropna=False, as_index=False)
+            .agg(
+                movement_date=("movement_date", "min"),
+                movement_month=("movement_month", "min"),
+                receipt_qty=("qty_in", "sum"),
+                unique_lotrols=(
+                    "lotrol",
+                    lambda values: values.fillna("")
+                    .astype(str)
+                    .str.strip()
+                    .replace("", pd.NA)
+                    .dropna()
+                    .nunique(),
+                ),
+            )
+            .sort_values(["movement_month", "source_file"])
+        )
+        source_file_rows.insert(0, "ibum_id", selected_ibum)
+
+    st.dataframe(
+        prepare_business_table(
+            source_file_rows,
+            columns=["ibum_id", "source_file", "movement_date", "movement_month", "receipt_qty", "unique_lotrols"],
+            numeric_columns=["receipt_qty"],
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    selected_summary = (
+        container_summary[container_summary["ibum_id"].astype(str) == selected_ibum].copy()
+        if not container_summary.empty and "ibum_id" in container_summary.columns
+        else pd.DataFrame()
+    )
+
+    st.subheader("Resumen por referencia/color")
+    if selected_summary.empty:
+        st.warning("No se encontraron filas de resumen para este IBUM.")
+    else:
+        st.dataframe(
+            prepare_business_table(
+                selected_summary,
+                columns=[
+                    "ibum_id",
+                    "reference",
+                    "description",
+                    "color_original",
+                    "receipt_qty",
+                    "roll_count",
+                    "unique_lotrols",
+                    "source_files",
+                    "validation_status",
+                ],
+                numeric_columns=["receipt_qty"],
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+        show_technical_columns(selected_summary, "container_summary_technical")
+
+    st.subheader("Registros por rollo / LOTROL")
+    if selected_import_detail.empty:
+        st.warning("No se encontraron registros por rollo para este IBUM.")
+    else:
+        st.dataframe(
+            prepare_business_table(
+                sort_existing(selected_import_detail, ["reference", "color_normalized", "lotrol"]),
+                columns=[
+                    "movement_date",
+                    "movement_month",
+                    "ibum_id",
+                    "source_file",
+                    "reference",
+                    "description",
+                    "color_original",
+                    "lot",
+                    "roll",
+                    "lotrol",
+                    "qty_in",
+                    "validation_status",
+                    "source_row",
+                ],
+                numeric_columns=["qty_in"],
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+        show_technical_columns(selected_import_detail, "container_rolls_technical")
+
+    st.subheader("LOTROLs duplicados")
+    duplicate_detail = pd.DataFrame()
+
+    if not duplicate_lotrols.empty and "ibum_id" in duplicate_lotrols.columns:
+        duplicate_detail = duplicate_lotrols[duplicate_lotrols["ibum_id"].fillna("").astype(str) == selected_ibum].copy()
+
+    if duplicate_detail.empty:
+        st.success("No se encontraron LOTROLs duplicados para este IBUM.")
+    else:
+        st.dataframe(
+            prepare_business_table(
+                duplicate_detail,
+                columns=[
+                    "lotrol",
+                    "reference",
+                    "description",
+                    "color_original",
+                    "ibum_id",
+                    "qty_in",
+                    "duplicate_qty_excluded",
+                    "source_file",
+                    "source_row",
+                    "validation_status",
+                ],
+                numeric_columns=MOVEMENT_NUMERIC_COLUMNS,
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+        show_technical_columns(duplicate_detail, "container_duplicates_technical")
+
+    if not selected_import_detail.empty:
+        st.download_button(
+            "Descargar detalle del IBUM CSV",
+            data=to_csv_bytes(selected_import_detail),
+            file_name=f"{selected_ibum.replace(':', '_')}_detalle_ibum.csv",
+            mime="text/csv",
+        )
+
+
+def render_export_report(data, filters):
+    st.subheader("Exportar reporte")
+    st.caption(
+        "Descarga el balance mensual, movimientos soporte, importaciones, ventas, "
+        "contenedores IBUM y alertas segun los filtros activos."
+    )
+    st.info(
+        "Nota: Las ventas disponibles actualmente vienen agregadas por reporte mensual, "
+        "referencia y color. Por eso la trazabilidad de ventas llega hasta la fila del "
+        "reporte de ventas, no hasta factura, cliente o rollo individual."
+    )
+
+    filtered_monthly = apply_inventory_filters(data.get("monthly_balance", pd.DataFrame()), filters)
+    available_months = (
+        sorted(filtered_monthly["movement_month"].dropna().astype(str).unique().tolist())
+        if not filtered_monthly.empty and "movement_month" in filtered_monthly.columns
+        else []
+    )
+
+    selected_export_months = st.multiselect("Periodos a exportar", options=available_months, default=available_months)
+
+    if is_export_unfiltered(filters):
+        st.warning("Estas a punto de exportar toda la informacion disponible.")
+
+    if available_months and not selected_export_months:
+        st.warning("Selecciona al menos un periodo para incluir datos en el reporte.")
+
+    if st.button("Preparar descargas", type="primary"):
+        st.session_state["export_report_ready"] = True
+
+    if not st.session_state.get("export_report_ready", False):
+        st.caption("Presiona Preparar descargas para generar el Excel y los CSV con los filtros actuales.")
+        return
+
+    export_tables = build_filtered_inventory_export(
+        data=data,
+        filters=filters,
+        filter_func=apply_inventory_filters,
+        selected_export_months=selected_export_months,
+    )
+    metadata = build_export_metadata(
+        export_tables=export_tables,
+        filters=filters,
+        selected_export_months=selected_export_months,
+    )
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Productos", f"{int(metadata.get('products_included', 0)):,}")
+    col2.metric("Movimientos soporte", f"{int(metadata.get('movement_support_rows', 0)):,}")
+    col3.metric("Importaciones", f"{int(metadata.get('import_rows', 0)):,}")
+    col4.metric("Ventas", f"{int(metadata.get('sales_rows', 0)):,}")
+
+    col5, col6, col7, col8 = st.columns(4)
+    col5.metric("Total importaciones", format_number(float(metadata.get("total_imports", 0) or 0)))
+    col6.metric("Total ventas", format_number(float(metadata.get("total_sales", 0) or 0)))
+    col7.metric("Saldo final", format_number(float(metadata.get("latest_closing_stock", 0) or 0)))
+    col8.metric("Alertas / excepciones", f"{int(metadata.get('exception_rows', 0)):,}")
+
+    try:
+        st.download_button(
+            "Descargar Excel",
+            data=build_excel_report_bytes(export_tables, metadata),
+            file_name=build_export_filename(filters, suffix="xlsx"),
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    except Exception as exc:
+        st.error(f"No se pudo generar el Excel: {exc}")
+
+    st.divider()
+    st.subheader("Descargar CSV")
+    csv_base_name = build_export_filename(filters, suffix="csv").replace(".csv", "")
+    csv_downloads = [
+        ("Balance mensual filtrado", "Balance mensual", "balance_mensual"),
+        ("Movimientos soporte", "Movimientos soporte", "movimientos_soporte"),
+        ("Importaciones / Contenedores", "Importaciones", "importaciones"),
+        ("Ventas", "Ventas", "ventas"),
+        ("Contenedores IBUM", "Contenedores IBUM", "contenedores_ibum"),
+        ("Alertas / Excepciones", "Excepciones", "excepciones"),
+    ]
+
+    for label, table_key, file_token in csv_downloads:
+        table = export_tables.get(table_key, pd.DataFrame())
+
+        if table.empty:
+            st.caption(f"{label}: sin filas para los filtros actuales.")
+            continue
+
+        st.download_button(
+            f"Descargar CSV - {label}",
+            data=dataframe_to_csv_bytes(table),
+            file_name=f"{csv_base_name}_{file_token}.csv",
+            mime="text/csv",
+            key=f"download_{file_token}",
+        )
+
+    st.divider()
+    st.subheader("Vista previa")
+    preview_table = export_tables.get("Balance mensual", pd.DataFrame())
+
+    if preview_table.empty:
+        st.warning("No hay balance mensual para los filtros seleccionados.")
+    else:
+        st.dataframe(
+            prepare_business_table(
+                preview_table.head(100),
+                columns=[
+                    "movement_month",
+                    "reference",
+                    "description",
+                    "color_original",
+                    "opening_balance",
+                    "opening_stock_qty",
+                    "imports_qty",
+                    "sales_qty",
+                    "returns_adjustments_qty",
+                    "net_change",
+                    "closing_balance",
+                ],
+                numeric_columns=INVENTORY_NUMERIC_COLUMNS,
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
 def main():
     render_header()
 
@@ -1581,13 +2450,13 @@ def main():
 
     tabs = st.tabs(
         [
-            "Overview",
-            "Monthly Balance",
+            "Resumen",
+            "Balance Mensual",
             "Trazabilidad",
-            "Containers / IBUM",
-            "Exportar reporte",
-            "Duplicate LOTROLs",
-            "Negative Inventory",
+            "Contenedores / IBUM",
+            "Exportar Reporte",
+            "LOTROLs Duplicados",
+            "Inventario Negativo",
         ]
     )
 
